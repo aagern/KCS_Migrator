@@ -1,17 +1,15 @@
-mod client;
-mod export;
-mod id_mapper;
-mod importer;
-mod users;
-
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
-use client::KcsClient;
+use kcs_migrator::client::KcsClient;
+use kcs_migrator::{export, importer, users};
 
 #[derive(Parser)]
-#[command(name = "kcs-migrator", about = "Export and import KCS configuration bundles")]
+#[command(
+    name = "kcs-migrator",
+    about = "Export and import KCS configuration bundles"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -32,6 +30,8 @@ enum Commands {
         host_header: Option<String>,
         #[arg(long, default_value = "kcs")]
         namespace: String,
+        #[arg(long, default_value = "kcs-postgresql")]
+        users_pod_selector: String,
         #[arg(long)]
         skip_users: bool,
     },
@@ -58,19 +58,16 @@ async fn main() -> Result<()> {
             no_verify_tls,
             host_header,
             namespace,
+            users_pod_selector,
             skip_users,
         } => {
-            let client = KcsClient::new(
-                &url,
-                &token,
-                !no_verify_tls,
-                host_header.as_deref(),
-            )?;
+            let verify_tls = !no_verify_tls;
+            let client = KcsClient::new(&url, &token, verify_tls, host_header.as_deref())?;
             let bundle = export::export_all(&client, &output).await?;
             println!("Bundle exported to: {}", bundle.display());
 
             if !skip_users {
-                match users::export_users_reference(&namespace, &bundle, "kcs-postgresql") {
+                match users::export_users_reference(&namespace, &bundle, &users_pod_selector) {
                     Ok(_) => println!("User reference exported successfully."),
                     Err(e) => eprintln!("Warning: Failed to export users: {e}"),
                 }
@@ -82,7 +79,8 @@ async fn main() -> Result<()> {
             token,
             no_verify_tls,
         } => {
-            let client = KcsClient::new(&url, &token, !no_verify_tls, None)?;
+            let verify_tls = !no_verify_tls;
+            let client = KcsClient::new(&url, &token, verify_tls, None)?;
             importer::import_bundle(&client, &bundle).await?;
             println!("Import complete.");
         }

@@ -3,6 +3,10 @@ name = "kcs_migrator"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+name = "kcs_migrator"
+path = "src/lib.rs"
+
 [[bin]]
 name = "kcs-migrator"
 path = "src/main.rs"

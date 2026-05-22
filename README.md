@@ -38,15 +38,22 @@ DATA for tool:
 
 ## Architecture
 
+The crate is split into a reusable library (`kcs_migrator`) and a thin CLI binary (`kcs-migrator`). The binary owns only the clap argument parsing and the `main` entry point; everything else lives in the library so it can be consumed from integration tests, doctests, or downstream tooling.
+
 ```
 src/
 ├── main.rs        CLI entry point (clap subcommands: export, import-bundle)
+├── lib.rs         Library crate root — re-exports the modules below
 ├── client.rs      KcsClient — async reqwest wrapper, injects Tron-Token header
-├── export.rs      export_all() — GETs every resource, writes versioned bundle
-├── importer.rs    import_bundle() — reads bundle, POST/PUT in dependency order
+├── export.rs      export_all() — orchestrates per-section helpers, writes versioned bundle
+├── importer.rs    import_bundle() — 14-step pipeline of single-responsibility helpers
 ├── id_mapper.rs   IdMapper — source-id → target-id registry for FK rewriting
 └── users.rs       export_users_reference() — kubectl exec into postgres pod
 ```
+
+`export_all` and `import_bundle` are short orchestrators that call per-section / per-step helpers in a fixed order. Each helper carries its own `///` docblock describing its inputs, outputs, and failure modes. See the module-level `//!` docs (`cargo doc --open`) for the full reference.
+
+**Graceful-skip behavior**: image registries with credential-based auth (`user_password`, `service_account`, …) and previously-deployed agent groups return HTTP 400 on re-POST because credentials and `deploymentToken`s cannot be replayed. The importer catches the 400, emits an `OPERATOR ACTION REQUIRED` warning, and continues with the next resource. All other failures abort the import.
 
 ---
 
@@ -87,10 +94,13 @@ ssh user@host "cd /tmp/kcs_migrator && ~/.cargo/bin/cargo build --release"
 ### Running the test suite
 
 ```bash
-cargo test
+cargo test           # all unit + doctests
+cargo test --doc     # doctests only (requires the library crate)
+cargo +nightly fmt -- --check
+cargo clippy --all-targets -- -D warnings
 ```
 
-All 24 unit tests run in ~0.03 s. They mock HTTP at the transport level (wiremock) and use tmpdir bundles — no live KCS instance required.
+26 unit tests + 3 doctests run in ~0.15 s. They mock HTTP at the transport level (wiremock) and use tmpdir bundles — no live KCS instance required.
 
 ---
 
@@ -124,13 +134,14 @@ Fetches all exportable resources from the source KCS instance and writes them to
 kcs-migrator export [OPTIONS]
 
 OPTIONS:
-    --url <URL>              KCS base URL including /api  [env: KCS_URL]
-    --token <TOKEN>          API token (Tron-Token header value)  [env: KCS_TOKEN]
-    --output <DIR>           Directory to write the bundle into  [default: .]
-    --no-verify-tls          Skip TLS certificate verification
-    --host-header <HOST>     Override the HTTP Host header (useful when connecting via IP)
-    --namespace <NS>         Kubernetes namespace for the kubectl user export  [default: kcs]
-    --skip-users             Skip the kubectl exec user export step
+    --url <URL>                       KCS base URL including /api  [env: KCS_URL]
+    --token <TOKEN>                   API token (Tron-Token header value)  [env: KCS_TOKEN]
+    --output <DIR>                    Directory to write the bundle into  [default: .]
+    --no-verify-tls                   Skip TLS certificate verification
+    --host-header <HOST>              Override the HTTP Host header (useful when connecting via IP)
+    --namespace <NS>                  Kubernetes namespace for the kubectl user export  [default: kcs]
+    --users-pod-selector <NAME>       StatefulSet name of the KCS Postgres pod  [default: kcs-postgresql]
+    --skip-users                      Skip the kubectl exec user export step
 ```
 
 ### `import-bundle`
@@ -193,8 +204,8 @@ Resources are created in this fixed sequence so that foreign-key references reso
 3. LDAP (full replace via PUT)
 4. SSO
 5. LLM
-6. Image registries → registers `image-registry` IDs in IdMapper
-7. Agent groups → registers `agent-group` IDs
+6. Image registries → registers `image-registry` IDs in IdMapper; credential-based registries gracefully skip on HTTP 400 (no credentials in bundle)
+7. Agent groups → registers `agent-group` IDs; gracefully skips on HTTP 400 (server-issued `deploymentToken` cannot be replayed)
 8. Scanner policies → enables each if `enabled: true`
 9. Assurance policies → enables each if `enabled: true`
 10. Runtime profiles → registers `runtime-profile` IDs

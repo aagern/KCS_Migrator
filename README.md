@@ -166,7 +166,7 @@ kcs-export-2026-10-06_12-00-00/
 │   ├── image-registries.json
 │   ├── ldap.json
 │   ├── sso.json
-│   ├── llm.json
+│   ├── llm-REFERENCE.json                      reference only — multipart upload
 │   ├── siem.json
 │   ├── external-groups.json
 │   ├── agent-groups.json
@@ -250,7 +250,7 @@ Whatever owns an ID is created before whatever references it.
 | 3 | Security scopes | read-only; matches bundle scopes to the target **by name** |
 | 4 | LDAP | `POST`, then `/{id}/enable` |
 | 5 | SSO | `POST`, then `/enable` |
-| 6 | LLM | |
+| 6 | LLM | warning only — the endpoint takes a multipart upload and `GET` returns status, not config |
 | 7 | SIEM integrations | |
 | 8 | Image registries | registers IDs; HTTP 400 skips with a warning |
 | 9 | External scan groups | |
@@ -265,9 +265,9 @@ Whatever owns an ID is created before whatever references it.
 | 18 | Runtime profiles | translated; registers IDs |
 | 19 | Runtime policies | rewrites `runtimeProfileId`; splits off an admission policy from an APIv1 bundle |
 | 20 | Notification channels | warning only — no create endpoint exists |
-| 21 | Response policies | unmappable channels dropped with a warning |
-| 22 | Custom-reputation list selection | |
-| 23 | Network-reputation blob | raw `PUT` |
+| 21 | Response policies | channels matched to the target **by name**; skipped if none match |
+| 22 | Custom-reputation list selection | `PUT .../toggle` |
+| 23 | Network-reputation blob | `multipart/form-data` upload, part named `file` |
 
 Steps 11–13 and 16–17 are the resource classes KCS 2.5 introduced. Against an APIv1 target
 they are skipped without a request, because 2.4 has no route for them and a 404 would abort
@@ -275,12 +275,23 @@ the import.
 
 ### Graceful skips
 
-Some resources cannot be replayed even with a complete body. Image registries using
-credential-based auth and previously-deployed agent groups return HTTP 400, because the
-bundle holds no credentials and the target mints its own deployment token. Those emit an
-`OPERATOR ACTION REQUIRED` warning naming the resource and the import continues. Scanner
-and assurance policies do **not** skip on 400 — there a 400 means the body is wrong, and
-hiding it would hide a translation bug.
+An HTTP 400 on one entry is a skip, never an abort — for every resource. A single refused
+entry must not cost the other twenty-two steps, and aborting partway leaves the target
+half-written with no resume path.
+
+Nothing is hidden by that, because each skip warning carries **the server's own message**.
+In practice they read very differently:
+
+| Server says | Means |
+|---|---|
+| `MDW-355 scanner policy name already exist` | The target already has it. Expected when re-running, or for a preset such as the `default` scanner policy that every instance ships. |
+| `MDW-399 name already exist` | Same, for runtime profiles. |
+| `MDW-415 scopes are empty` | The body this tool built is wrong. A bug — report it. |
+| `HTTP-002 ... failed on the 'required' tag` | A required field is missing. Also a bug. |
+
+Image registries using credential-based auth and previously-deployed agent groups always
+return 400, because the bundle holds no credentials and the target mints its own deployment
+token.
 
 ---
 
@@ -297,7 +308,8 @@ own when an agent group is created.
 
 | Resource | Why manual |
 |---|---|
-| Notification channels (email / Telegram / webhook) | No create endpoint in any generation |
+| LLM integration | `POST`/`PUT` take a `multipart/form-data` upload, and what `GET` returns is connection status rather than configuration |
+| Notification channels (email / Telegram / webhook) | No create endpoint in any generation. A policy referencing one is remapped **by name** if the target already has a channel with that name, so recreate them *before* importing |
 | Image signature validators | No create endpoint |
 | Security scopes | `/security/scopes` is GET-only. Create them on the target **with the same names** before importing, and references are remapped automatically |
 | User accounts | Credentials not in the bundle; exported as reference via `kubectl exec` |
@@ -346,7 +358,7 @@ cargo test --doc
 cargo doc --no-deps                                    # must emit zero warnings
 ```
 
-145 unit tests, 8 doctests and 2 compile-fail cases. HTTP is mocked at the transport layer
+153 unit tests, 15 doctests and 2 compile-fail cases. HTTP is mocked at the transport layer
 with `wiremock` and bundles are built in temp directories, so no live KCS instance is
 needed.
 

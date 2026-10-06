@@ -317,8 +317,12 @@ async fn export_integrations(client: &KcsClient, bundle: &Path) -> Result<()> {
     let sso = get_single(client, "/integrations/sso").await?;
     write_json(&bundle.join("integrations/sso.json"), &sso)?;
 
+    // Reference-only: the create endpoint takes a multipart upload and what GET
+    // returns is connection status, not configuration. Kept in the bundle so an
+    // operator can see which provider was connected, under the -REFERENCE name
+    // that marks every file the importer will not replay.
     let llm = get_single(client, "/integrations/llm").await?;
-    write_json(&bundle.join("integrations/llm.json"), &llm)?;
+    write_json(&bundle.join("integrations/llm-REFERENCE.json"), &llm)?;
 
     let mut agent_groups = get_list_detailed(
         client,

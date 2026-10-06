@@ -231,6 +231,41 @@ impl std::fmt::Debug for KcsClient {
     }
 }
 
+/// Turns a non-2xx response into an error that carries the server's own
+/// message, and leaves a 2xx response untouched.
+///
+/// [`reqwest::Response::error_for_status`] alone produces
+/// `HTTP status client error (400 Bad Request) for url (...)` and discards
+/// the body — so an operator watching an import abort is told only the
+/// number. KCS puts the actual reason there, e.g.
+/// `MDW-415 "scopes are empty"  field: systemScopes`, which is the
+/// difference between a usable report and a guess.
+///
+/// The [`reqwest::Error`] is kept as the error's source, so the callers that
+/// branch on the status via [`error_status`] keep working.
+async fn with_body_context(resp: reqwest::Response) -> Result<reqwest::Response> {
+    let status = resp.status();
+    if !status.is_client_error() && !status.is_server_error() {
+        return Ok(resp);
+    }
+
+    let url = resp.url().to_string();
+    // The body has to be taken before `error_for_status`, which consumes the
+    // response; `error_for_status_ref` keeps it available.
+    let status_err = resp.error_for_status_ref().err();
+    let body = resp.text().await.unwrap_or_default();
+    let detail = body.trim();
+    let detail = if detail.is_empty() {
+        "<empty response body>".to_string()
+    } else {
+        // Long HTML error pages are not worth pasting in full.
+        detail.chars().take(400).collect()
+    };
+
+    let err = status_err.map_or_else(|| anyhow!("HTTP {status} for {url}"), anyhow::Error::new);
+    Err(err.context(format!("{} said: {detail}", status.as_u16())))
+}
+
 impl KcsClient {
     /// # Overview
     ///
@@ -404,8 +439,8 @@ impl KcsClient {
             .get(self.url(path))
             .header(CONTENT_TYPE, "application/json")
             .send()
-            .await?
-            .error_for_status()?;
+            .await?;
+        let resp = with_body_context(resp).await?;
         Ok(resp.json().await?)
     }
 
@@ -425,12 +460,8 @@ impl KcsClient {
     /// Returns the transport error, or an HTTP status error for any
     /// non-2xx response.
     pub async fn get_bytes(&self, path: &str) -> Result<Vec<u8>> {
-        let resp = self
-            .http
-            .get(self.url(path))
-            .send()
-            .await?
-            .error_for_status()?;
+        let resp = self.http.get(self.url(path)).send().await?;
+        let resp = with_body_context(resp).await?;
         Ok(resp.bytes().await?.to_vec())
     }
 
@@ -465,8 +496,8 @@ impl KcsClient {
             .header(CONTENT_TYPE, "application/json")
             .json(body)
             .send()
-            .await?
-            .error_for_status()?;
+            .await?;
+        let resp = with_body_context(resp).await?;
         Ok(resp.json().await?)
     }
 
@@ -503,14 +534,55 @@ impl KcsClient {
             .header(CONTENT_TYPE, "application/json")
             .json(body)
             .send()
-            .await?
-            .error_for_status()?;
+            .await?;
+        let resp = with_body_context(resp).await?;
         let bytes = resp.bytes().await?;
         if bytes.is_empty() {
             Ok(serde_json::Value::Object(serde_json::Map::default()))
         } else {
             Ok(serde_json::from_slice(&bytes)?)
         }
+    }
+
+    /// # Overview
+    ///
+    /// Sends `PUT` to the version-relative `path` with `data` as a single
+    /// `multipart/form-data` file part named `field`.
+    ///
+    /// Used for the custom-reputation list upload. That endpoint rejects
+    /// `application/octet-stream` with
+    /// `request Content-Type isn't multipart/form-data`, even though the
+    /// published v3 `OpenAPI` document declares octet-stream for it — one
+    /// more place where the document and the server disagree and the
+    /// server wins. The part name `file` was established against the live
+    /// instance; `list`, `data` and `reputation` all return
+    /// `http: no such file`.
+    ///
+    /// # Cancel safety
+    ///
+    /// Cancel-safe for this process, but **not idempotent**. See the
+    /// module docs.
+    ///
+    /// # Errors
+    ///
+    /// Returns the transport error, or an HTTP status error carrying the
+    /// server's message for any non-2xx response.
+    pub async fn put_multipart_file(
+        &self,
+        path: &str,
+        field: &str,
+        filename: &str,
+        data: Vec<u8>,
+    ) -> Result<()> {
+        if self.dry_run {
+            self.describe_suppressed_write("PUT", path, data.len());
+            return Ok(());
+        }
+        let part = reqwest::multipart::Part::bytes(data).file_name(filename.to_string());
+        let form = reqwest::multipart::Form::new().part(field.to_string(), part);
+        let resp = self.http.put(self.url(path)).multipart(form).send().await?;
+        with_body_context(resp).await?;
+        Ok(())
     }
 
     /// # Overview
@@ -568,13 +640,14 @@ impl KcsClient {
             self.describe_suppressed_write("PUT", path, data.len());
             return Ok(());
         }
-        self.http
+        let resp = self
+            .http
             .put(self.url(path))
             .header(CONTENT_TYPE, "application/octet-stream")
             .body(data)
             .send()
-            .await?
-            .error_for_status()?;
+            .await?;
+        with_body_context(resp).await?;
         Ok(())
     }
 }

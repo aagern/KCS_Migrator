@@ -14,7 +14,7 @@
 //!  3  security scopes            read-only; matches bundle scopes to the target by name
 //!  4  LDAP                       POST + /{id}/enable
 //!  5  SSO                        POST + /enable
-//!  6  LLM
+//!  6  LLM                        warning only, endpoint takes a multipart upload
 //!  7  SIEM integrations
 //!  8  image registries           registers IDs; 400 -> skip + warn
 //!  9  external scan groups
@@ -77,7 +77,7 @@
 
 use crate::bundle::Manifest;
 use crate::cel;
-use crate::client::{error_status, KcsClient};
+use crate::client::{error_status, is_client_error, KcsClient};
 use crate::id_mapper::IdMapper;
 use crate::translate::{Resource, Translator};
 use crate::version::{ApiVersion, KcsVersion};
@@ -99,6 +99,14 @@ const STRIP_FIELDS: &[&str] = &[
     "status",
     "message",
     "deploymentToken",
+    // Read-only mirror of `systemScopes`, returned only by the scanner-policy
+    // endpoint. `derive_system_scopes` turns it into `systemScopes` first; sending
+    // it back would at best be ignored.
+    "usedSystemScopes",
+    // Read-only mirror returned by the response-policy endpoint as
+    // [{id, name, type}]; POST wants `notificationSettingsIds` instead, which
+    // `derive_notification_ids` builds from it.
+    "notificationSettings",
 ];
 
 /// Returns a copy of `body` with [`STRIP_FIELDS`] removed and any
@@ -212,6 +220,45 @@ fn report_translation(
     }
 }
 
+/// Creates one resource, returning `None` when the server refuses that
+/// single entry with an HTTP 400.
+///
+/// Shared by every importer that creates something, so the graceful-skip
+/// contract is defined once. It used to be written out at each call site,
+/// and the copies had already drifted: the four collection importers
+/// skipped, while the three that do foreign-key work aborted — so a
+/// "name already exist" on one runtime profile killed an import at step
+/// 18, after seventeen steps had written to the target.
+///
+/// The warning carries the server's own message. That is what stops a
+/// blanket skip hiding a real defect: "name already exist" is routine on
+/// a target that already holds the resource, while "scopes are empty"
+/// means the body this tool built is wrong.
+///
+/// # Errors
+///
+/// Propagates anything that is not a 400, and the error from
+/// [`tgt_id_from`] if the server accepts the create but returns no id.
+async fn create_or_skip(
+    client: &KcsClient,
+    endpoint: &str,
+    body: &Value,
+    kind: &str,
+    name: &str,
+) -> Result<Option<String>> {
+    match client.post(endpoint, body).await {
+        Ok(result) => Ok(Some(tgt_id_from(&result, &format!("{kind} '{name}'"))?)),
+        Err(e) if is_bad_request(&e) => {
+            eprintln!(
+                "OPERATOR ACTION REQUIRED: {kind} '{name}' was not imported \
+                 (HTTP 400): {e}. Check it in the target console."
+            );
+            Ok(None)
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// Reports a bundle entry with no usable source `id` and tells the caller
 /// to skip it.
 ///
@@ -246,8 +293,26 @@ fn warn_dropped_scopes(kind: &str, name: &str, dropped: &[String]) {
     );
 }
 
+/// Whether a response policy can still be created after its notification
+/// channels were remapped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NotificationOutcome {
+    /// Keeps at least one channel, or never had any.
+    Importable,
+    /// Had channels and none of them exist on the target, so the API would
+    /// reject it for an empty `notificationSettingsIds`.
+    Unimportable,
+}
+
 /// Mapper resource type under which security scopes are registered.
 const SCOPE_TYPE: &str = "scope";
+
+/// Target scope name to target scope ID.
+///
+/// Kept beside the [`IdMapper`] rather than inside it because the mapper is
+/// keyed by *source* ID, and the scanner-policy path has only a name to go
+/// on.
+type ScopeIndex = std::collections::HashMap<String, String>;
 
 /// # Overview
 ///
@@ -296,26 +361,29 @@ async fn register_security_scopes(
     client: &KcsClient,
     bundle: &Path,
     mapper: &mut IdMapper,
-) -> Result<()> {
-    let path = bundle.join("security/scopes-REFERENCE.json");
-    if !path.exists() {
-        eprintln!(
-            "Note: this bundle carries no security/scopes-REFERENCE.json, so scope \
-             references are replayed unchanged. Check every policy's scope on the target."
-        );
-        return Ok(());
-    }
-
-    let bundle_scopes = read_json(&path)?;
-    let target_scopes = client.get("/security/scopes").await?;
-
-    // Mark the class considered before matching anything. A bundle that lists its
-    // scopes but matches none of them must still have its stale IDs dropped, and
-    // that is indistinguishable from "no scope file" by map contents alone.
-    mapper.declare_type(SCOPE_TYPE);
-
-    // name -> target id
-    let mut by_name: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+) -> Result<ScopeIndex> {
+    // The target's scopes are always read, even when the bundle has no reference
+    // file: scanner policies carry their scope *names* inline in
+    // `usedSystemScopes`, so `derive_system_scopes` can match them without it.
+    // Only the source-ID-to-target-ID mapping needs the bundle file.
+    // A 4xx here is tolerated rather than fatal: the scope list is an input to
+    // remapping, not a precondition for importing, and a target that does not
+    // serve it (or a token without permission for it) should not stop the whole
+    // migration before step 1. Anything else — a transport failure, a 5xx —
+    // means the target is not usable at all, so it still propagates.
+    let target_scopes = match client.get("/security/scopes").await {
+        Ok(scopes) => scopes,
+        Err(e) if is_client_error(&e) => {
+            eprintln!(
+                "Note: could not read the target's security scopes ({e}); \
+                 `systemScopes` references are replayed unchanged. Check every \
+                 policy's scope on the target."
+            );
+            Value::Array(Vec::new())
+        }
+        Err(e) => return Err(e),
+    };
+    let mut by_name = ScopeIndex::new();
     for scope in target_scopes.as_array().unwrap_or(&Vec::new()) {
         if let (Some(name), Some(id)) = (
             scope.get("name").and_then(Value::as_str),
@@ -324,6 +392,23 @@ async fn register_security_scopes(
             by_name.insert(name.to_string(), id.to_string());
         }
     }
+
+    let path = bundle.join("security/scopes-REFERENCE.json");
+    if !path.exists() {
+        eprintln!(
+            "Note: this bundle carries no security/scopes-REFERENCE.json, so \
+             `systemScopes` references are replayed unchanged. Check every policy's \
+             scope on the target."
+        );
+        return Ok(by_name);
+    }
+
+    let bundle_scopes = read_json(&path)?;
+
+    // Mark the class considered before matching anything. A bundle that lists its
+    // scopes but matches none of them must still have its stale IDs dropped, and
+    // that is indistinguishable from "no scope file" by map contents alone.
+    mapper.declare_type(SCOPE_TYPE);
 
     let mut unmatched = Vec::new();
     for scope in bundle_scopes.as_array().unwrap_or(&Vec::new()) {
@@ -347,7 +432,52 @@ async fn register_security_scopes(
              policies that referenced them to lose their scope."
         );
     }
-    Ok(())
+    Ok(by_name)
+}
+
+/// Builds `systemScopes` from `usedSystemScopes` when a resource has only the
+/// latter, mapping each entry onto the target by **name**.
+///
+/// Scanner policies are the one class whose `GET` returns
+/// `usedSystemScopes` — an array of `{id, name, description}` — and no
+/// `systemScopes`, which is what `POST` requires. Replaying the body as
+/// exported is rejected with `400 MDW-415 "scopes are empty"`.
+///
+/// Matching by name rather than by ID is both necessary and better here:
+/// the inline objects carry their own name, so this works even for a
+/// bundle with no scope reference file.
+///
+/// Returns the names that have no counterpart on the target; those are
+/// dropped, because a stale scope ID is accepted and silently scopes the
+/// policy to nothing.
+fn derive_system_scopes(
+    body: &mut Value,
+    source: &Value,
+    scopes_by_name: &ScopeIndex,
+) -> Vec<String> {
+    if body.get("systemScopes").is_some() {
+        return Vec::new();
+    }
+    let Some(used) = source.get("usedSystemScopes").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+
+    let mut derived = Vec::with_capacity(used.len());
+    let mut unmatched = Vec::new();
+    for entry in used {
+        let Some(name) = entry.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        match scopes_by_name.get(name) {
+            Some(tgt_id) => derived.push(Value::String(tgt_id.clone())),
+            None => unmatched.push(name.to_string()),
+        }
+    }
+
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert("systemScopes".to_string(), Value::Array(derived));
+    }
+    unmatched
 }
 
 /// Rewrites a resource's `systemScopes` array into the target's ID space.
@@ -402,6 +532,7 @@ async fn import_collection(
     collection: &PolicyCollection<'_>,
     mapper: &mut IdMapper,
     translator: Translator,
+    scopes_by_name: &ScopeIndex,
 ) -> Result<usize> {
     let PolicyCollection {
         file_rel,
@@ -440,27 +571,31 @@ async fn import_collection(
 
         let mut body = strip(item);
         report_translation(translator, resource, &mut body, resource_type, &name);
-        let unscoped = remap_system_scopes(&mut body, mapper);
+        let mut unscoped = remap_system_scopes(&mut body, mapper);
+        // Scanner policies arrive with `usedSystemScopes` instead, so derive the
+        // field POST requires from it. Reads `item`, not `body`: `strip` has
+        // already removed the read-only mirror by this point.
+        unscoped.extend(derive_system_scopes(&mut body, item, scopes_by_name));
         warn_dropped_scopes(resource_type, &name, &unscoped);
 
-        match client.post(endpoint, &body).await {
-            Ok(result) => {
-                let tgt_id = tgt_id_from(&result, &format!("{resource_type} '{name}'"))?;
+        if graceful_400 {
+            if let Some(tgt_id) =
+                create_or_skip(client, endpoint, &body, resource_type, &name).await?
+            {
                 mapper.register(resource_type, &src_id, &tgt_id);
                 created += 1;
                 if enabled {
                     enable_policy(client, endpoint, &tgt_id).await?;
                 }
             }
-            // Same contract as image registries, where it applies: a 400 means
-            // this one entry cannot be replayed, not that the import is broken.
-            Err(e) if graceful_400 && is_bad_request(&e) => {
-                eprintln!(
-                    "OPERATOR ACTION REQUIRED: {resource_type} '{name}' was not imported \
-                     (HTTP 400). Recreate it in the target console."
-                );
+        } else {
+            let result = client.post(endpoint, &body).await?;
+            let tgt_id = tgt_id_from(&result, &format!("{resource_type} '{name}'"))?;
+            mapper.register(resource_type, &src_id, &tgt_id);
+            created += 1;
+            if enabled {
+                enable_policy(client, endpoint, &tgt_id).await?;
             }
-            Err(e) => return Err(e),
         }
     }
     Ok(created)
@@ -477,13 +612,22 @@ async fn import_or_skip_v3_only(
     group: &[PolicyCollection<'_>],
     mapper: &mut IdMapper,
     translator: Translator,
+    scopes_by_name: &ScopeIndex,
 ) -> Result<()> {
     // Asked of the client rather than passed in: one source of truth, and one
     // fewer `bool` parameter at a call site that already has five.
     let target_is_v3 = client.api_version() == ApiVersion::V3;
     for collection in group {
         if target_is_v3 {
-            import_collection(client, bundle, collection, mapper, translator).await?;
+            import_collection(
+                client,
+                bundle,
+                collection,
+                mapper,
+                translator,
+                scopes_by_name,
+            )
+            .await?;
         } else {
             note_v3_only_skip(
                 collection.resource_type,
@@ -529,8 +673,13 @@ async fn import_custom_reputation_toggle(client: &KcsClient, bundle: &Path) -> R
     let Some(enabled_list) = state.get("enabledList").and_then(Value::as_str) else {
         return Ok(());
     };
+    // PUT, not POST: POST returns 404 "page not found" because the route does
+    // not exist with that method. Found by a live round-trip, which is the only
+    // thing that could have caught it -- the mock accepted whichever verb the
+    // test used, so the test and the code agreed with each other and not with
+    // the server.
     client
-        .post(
+        .put_json(
             "/policies/custom-reputation/toggle",
             &json!({ "enabledList": enabled_list }),
         )
@@ -644,12 +793,41 @@ async fn import_sso(client: &KcsClient, bundle: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Replays the LLM integration via `POST /integrations/llm`.
-/// No-op if the bundle file has no `type` field.
-async fn import_llm(client: &KcsClient, bundle: &Path) -> Result<()> {
-    let llm = read_json(&bundle.join("integrations/llm.json"))?;
-    if llm.get("type").is_some() {
-        client.post("/integrations/llm", &strip(&llm)).await?;
+/// Reports the LLM integration as needing manual recreation.
+///
+/// Reference-only, for two independent reasons:
+///
+/// 1. `POST /integrations/llm` takes `multipart/form-data` — it is a file
+///    upload, not a JSON body. Sending JSON returns
+///    `400 request Content-Type isn't multipart/form-data`, and because
+///    400 was not a graceful-skip status here it aborted the entire
+///    import at step 6, before a single policy had been replayed.
+/// 2. What `GET` returns is runtime *status* — `connectionStatus`,
+///    `totalTokensRemain`, `lastUpdated` — not configuration. Even with
+///    the right content type there is nothing in the bundle worth
+///    restoring.
+///
+/// Both were found by a live round-trip against KCS 2.5.0; the mocked
+/// tests had accepted whatever body the importer sent.
+fn warn_llm_reference(bundle: &Path) -> Result<()> {
+    // `llm-REFERENCE.json` is what this version writes; `llm.json` is what every
+    // earlier bundle has, and those still need the notice.
+    let Some(path) = [
+        bundle.join("integrations/llm-REFERENCE.json"),
+        bundle.join("integrations/llm.json"),
+    ]
+    .into_iter()
+    .find(|p| p.exists()) else {
+        return Ok(());
+    };
+    let llm = read_json(&path)?;
+    if let Some(kind) = llm.get("type").and_then(Value::as_str) {
+        eprintln!(
+            "OPERATOR ACTION REQUIRED: the LLM integration ('{kind}') cannot be imported \
+             automatically — its endpoint takes a multipart upload and the exported body \
+             is connection status rather than configuration. Reconnect it in the target \
+             console."
+        );
     }
     Ok(())
 }
@@ -790,10 +968,12 @@ struct PolicyCollection<'a> {
     /// An HTTP 400 on one entry is a skip-with-warning rather than a hard
     /// failure.
     ///
-    /// True for resources whose creation can legitimately be refused —
-    /// an entry needing credentials the bundle does not hold. False for
-    /// the policy classes, where a 400 means the body is wrong and
-    /// continuing would hide it.
+    /// True everywhere: a single refused entry must not cost the other
+    /// twenty steps, and aborting partway leaves the target half-written
+    /// with no resume path. Nothing is hidden, because the skip warning
+    /// carries the server's own message — the difference between
+    /// "name already exist" and "scopes are empty" is exactly what tells
+    /// an operator whether this is expected or a bug.
     graceful_400: bool,
 }
 
@@ -868,9 +1048,7 @@ mod collections {
         resource_type: "scanner-policy",
         resource: Resource::ScannerPolicy,
         has_cel: false,
-        // A 400 on a scanner policy means the body is wrong, not that this one
-        // entry is unreplayable. Hiding it would hide a translation bug.
-        graceful_400: false,
+        graceful_400: true,
     };
     pub const ASSURANCE_POLICIES: PolicyCollection<'static> = PolicyCollection {
         file_rel: "policies/assurance.json",
@@ -878,7 +1056,7 @@ mod collections {
         resource_type: "assurance-policy",
         resource: Resource::AssurancePolicy,
         has_cel: false,
-        graceful_400: false,
+        graceful_400: true,
     };
 
     /// The classes KCS 2.5 introduced, which an `APIv1` target has no route for.
@@ -923,9 +1101,17 @@ async fn import_runtime_profiles(
         );
         let unscoped = remap_system_scopes(&mut body, mapper);
         warn_dropped_scopes("runtime profile", &name, &unscoped);
-        let result = client.post("/policies/runtime-profile", &body).await?;
-        let tgt_id = tgt_id_from(&result, &format!("runtime profile '{name}'"))?;
-        mapper.register("runtime-profile", &src_id, &tgt_id);
+        let created = create_or_skip(
+            client,
+            "/policies/runtime-profile",
+            &body,
+            "runtime profile",
+            &name,
+        )
+        .await?;
+        if let Some(tgt_id) = created {
+            mapper.register("runtime-profile", &src_id, &tgt_id);
+        }
     }
     Ok(())
 }
@@ -947,6 +1133,22 @@ async fn import_runtime_policies(
     mapper: &mut IdMapper,
     translator: Translator,
 ) -> Result<()> {
+    // A KCS 2.5 instance serves /v1/policies/admission-controller through its
+    // compatibility shim, so a bundle exported with --api-version v1 from a 2.5
+    // source carries admission policies twice: as their own resource, and inline
+    // on every runtime policy. Importing the file *and* splitting would create
+    // each one twice, with no error. The explicit resource wins; a true 2.4
+    // source has no such route, so its file is empty and the split still carries
+    // the controls.
+    let already_imported = count_entries(bundle, "policies/admission-controller.json") > 0;
+    if already_imported && !translator.is_noop() {
+        eprintln!(
+            "Note: this bundle lists admission-controller policies as their own \
+             resource, so the admission half of each runtime policy is not split out \
+             again. That is expected for a bundle exported from KCS 2.5 with \
+             --api-version v1."
+        );
+    }
     let Value::Array(arr) = read_json(&bundle.join("policies/runtime.json"))? else {
         return Ok(());
     };
@@ -968,16 +1170,21 @@ async fn import_runtime_policies(
         rewrite_runtime_profile_match_blocks(&mut body, pol, &src_id, mapper)?;
         let unscoped = remap_system_scopes(&mut body, mapper);
         warn_dropped_scopes("runtime policy", &name, &unscoped);
-        let result = client.post("/policies/runtime", &body).await?;
-        let tgt_id = tgt_id_from(&result, &format!("runtime policy '{name}'"))?;
+        let Some(tgt_id) =
+            create_or_skip(client, "/policies/runtime", &body, "runtime policy", &name).await?
+        else {
+            // No runtime half means no admission half to pair with it.
+            continue;
+        };
         mapper.register("runtime-policy", &src_id, &tgt_id);
         if enabled {
             enable_policy(client, "/policies/runtime", &tgt_id).await?;
         }
 
-        // The admission half, when the source had admission control in use. On a
-        // v1 target this is None, because no split happened.
-        if let Some(admission) = admission_src {
+        // The admission half, when the source had admission control in use and the
+        // bundle did not already carry it as its own resource. On a v1 target
+        // `admission_src` is None anyway, because no split happened.
+        if let Some(admission) = admission_src.filter(|_| !already_imported) {
             import_split_admission_policy(client, &admission, &name, enabled, mapper).await?;
         }
     }
@@ -1144,6 +1351,7 @@ async fn import_response_policies(
     bundle: &Path,
     mapper: &mut IdMapper,
     strict: bool,
+    channels: &ScopeIndex,
 ) -> Result<()> {
     let Value::Array(arr) = read_json(&bundle.join("policies/response.json"))? else {
         return Ok(());
@@ -1157,17 +1365,127 @@ async fn import_response_policies(
         let name = name_or_id(pol, "name", &src_id).to_string();
         let enabled = pol["enabled"].as_bool().unwrap_or(false);
         let mut body = strip(pol);
-        rewrite_notification_settings_ids(&mut body, pol, &src_id, mapper, strict)?;
+        // Legacy path first, for a bundle that really does carry
+        // `notificationSettingsIds`; then the real one, from
+        // `notificationSettings`.
+        if rewrite_notification_settings_ids(&mut body, pol, &src_id, mapper, strict)?
+            == NotificationOutcome::Unimportable
+        {
+            continue;
+        }
+        let (matched, unmatched) = derive_notification_ids(&mut body, pol, channels);
+        if !unmatched.is_empty() {
+            eprintln!(
+                "OPERATOR ACTION REQUIRED: response policy '{name}' references \
+                 notification channel(s) {unmatched:?} that do not exist on the target. \
+                 Channels cannot be created through the API — recreate them in the \
+                 target console with the same names."
+            );
+        }
+        if matched == 0 && !unmatched.is_empty() {
+            if strict {
+                return Err(anyhow!(
+                    "Cannot import response policy '{name}': none of its notification \
+                     channels {unmatched:?} exist on the target."
+                ));
+            }
+            eprintln!(
+                "OPERATOR ACTION REQUIRED: response policy '{name}' was NOT imported — \
+                 the API requires at least one notification channel and none of its \
+                 channels exist on the target. Recreate them, then re-run the import."
+            );
+            continue;
+        }
         let unscoped = remap_system_scopes(&mut body, mapper);
         warn_dropped_scopes("response policy", &name, &unscoped);
-        let result = client.post("/policies/response", &body).await?;
-        let tgt_id = tgt_id_from(&result, &format!("response policy '{name}'"))?;
+        let Some(tgt_id) = create_or_skip(
+            client,
+            "/policies/response",
+            &body,
+            "response policy",
+            &name,
+        )
+        .await?
+        else {
+            continue;
+        };
         mapper.register("response-policy", &src_id, &tgt_id);
         if enabled {
             enable_policy(client, "/policies/response", &tgt_id).await?;
         }
     }
     Ok(())
+}
+
+/// Builds a name-to-ID index of the target's notification channels.
+///
+/// Channels cannot be created through the API — all three endpoints are
+/// GET-only — but a target that already holds a channel of the same name
+/// can still be referenced. That is what lets response policies migrate
+/// at all.
+///
+/// A 4xx on any of the three lists is tolerated: it means that channel
+/// type is unavailable, not that the import should stop.
+async fn index_notification_channels(client: &KcsClient) -> Result<ScopeIndex> {
+    let mut by_name = ScopeIndex::new();
+    for kind in ["email", "telegram", "webhook"] {
+        let path = format!("/integrations/notification-settings/{kind}");
+        let list = match client.get(&path).await {
+            Ok(v) => v,
+            Err(e) if is_client_error(&e) => continue,
+            Err(e) => return Err(e),
+        };
+        // These endpoints wrap their rows in `items`, unlike /security/scopes.
+        let rows = list
+            .get("items")
+            .and_then(Value::as_array)
+            .or_else(|| list.as_array())
+            .cloned()
+            .unwrap_or_default();
+        for row in &rows {
+            if let (Some(name), Some(id)) = (
+                row.get("name").and_then(Value::as_str),
+                row.get("id").and_then(Value::as_str),
+            ) {
+                by_name.insert(name.to_string(), id.to_string());
+            }
+        }
+    }
+    Ok(by_name)
+}
+
+/// Builds `notificationSettingsIds` from the `notificationSettings` objects
+/// a response policy actually carries, matching each by name.
+///
+/// Returns the names with no counterpart on the target. Those are dropped;
+/// if that leaves nothing, the caller skips the policy, because the API
+/// rejects an empty `notificationSettingsIds` outright.
+fn derive_notification_ids(
+    body: &mut Value,
+    source: &Value,
+    channels: &ScopeIndex,
+) -> (usize, Vec<String>) {
+    let Some(settings) = source.get("notificationSettings").and_then(Value::as_array) else {
+        return (0, Vec::new());
+    };
+
+    let mut ids = Vec::with_capacity(settings.len());
+    let mut unmatched = Vec::new();
+    for entry in settings {
+        let Some(name) = entry.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        match channels.get(name) {
+            Some(tgt_id) => ids.push(Value::String(tgt_id.clone())),
+            None => unmatched.push(name.to_string()),
+        }
+    }
+
+    let matched = ids.len();
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert("notificationSettingsIds".to_string(), Value::Array(ids));
+    }
+    (matched, unmatched)
 }
 
 /// Rewrites the `notificationSettingsIds` array on a response-policy body
@@ -1202,13 +1520,13 @@ fn rewrite_notification_settings_ids(
     src_id: &str,
     mapper: &IdMapper,
     strict: bool,
-) -> Result<()> {
+) -> Result<NotificationOutcome> {
     let Some(notif_ids) = body
         .get("notificationSettingsIds")
         .and_then(|v| v.as_array())
         .cloned()
     else {
-        return Ok(());
+        return Ok(NotificationOutcome::Importable);
     };
 
     let mut resolved = Vec::with_capacity(notif_ids.len());
@@ -1232,6 +1550,20 @@ fn rewrite_notification_settings_ids(
                  --strict-notifications to import the policy without them."
             ));
         }
+        // Every channel unmappable means the policy cannot exist on the target at
+        // all: the API requires a non-empty notificationSettingsIds, rejecting an
+        // empty list with HTTP-002 "failed on the 'required' tag". Sending it
+        // anyway would report a prerequisite problem as a server complaint.
+        if resolved.is_empty() {
+            eprintln!(
+                "OPERATOR ACTION REQUIRED: response policy '{policy_name}' was NOT \
+                 imported. Every notification channel it uses ({missing:?}) is absent \
+                 from the target, and the API will not accept a response policy with no \
+                 channels. Recreate those channels in the target console, then re-run \
+                 the import for this policy."
+            );
+            return Ok(NotificationOutcome::Unimportable);
+        }
         eprintln!(
             "OPERATOR ACTION REQUIRED: response policy '{policy_name}' was imported \
              WITHOUT its notification channels {missing:?}, because channels cannot be \
@@ -1246,7 +1578,7 @@ fn rewrite_notification_settings_ids(
             Value::Array(resolved),
         );
     }
-    Ok(())
+    Ok(NotificationOutcome::Importable)
 }
 
 /// Uploads the network-reputation binary blob via
@@ -1262,9 +1594,51 @@ async fn import_network_reputation(client: &KcsClient, bundle: &Path) -> Result<
         return Ok(());
     }
     client
-        .put_bytes("/policies/custom-reputation/import", data)
+        .put_multipart_file(
+            "/policies/custom-reputation/import",
+            "file",
+            "network-reputation.bin",
+            data,
+        )
         .await?;
     Ok(())
+}
+
+/// Steps 20 to 23: the notification warning, response policies, and the two
+/// custom-reputation steps.
+///
+/// Split out of [`import_bundle`] to keep that function readable — it is the
+/// list of pipeline steps, and the step order is the dependency contract, so
+/// it earns its line budget more than these four do. They belong together:
+/// all four depend on notification channels or on the reputation list, and
+/// none of them registers an ID anything later needs.
+///
+/// # Errors
+///
+/// Propagates any hard failure from the four steps.
+async fn import_response_and_reputation(
+    client: &KcsClient,
+    bundle: &Path,
+    mapper: &mut IdMapper,
+    options: &ImportOptions,
+) -> Result<()> {
+    warn_notifications_reference(bundle)?;
+
+    // Channels cannot be created, but a target that already holds one of the
+    // same name can be referenced — so the index is built before the policies
+    // that need it.
+    let channels = index_notification_channels(client).await?;
+    import_response_policies(
+        client,
+        bundle,
+        mapper,
+        options.strict_notifications,
+        &channels,
+    )
+    .await?;
+
+    import_custom_reputation_toggle(client, bundle).await?;
+    import_network_reputation(client, bundle).await
 }
 
 /// # Overview
@@ -1351,11 +1725,19 @@ pub async fn import_bundle(
     // Before anything that carries `systemScopes`: scopes cannot be created
     // through the API, so this reads both sides and matches them by name. It is
     // the only step that writes nothing.
-    register_security_scopes(client, bundle, &mut mapper).await?;
+    let scopes_by_name = register_security_scopes(client, bundle, &mut mapper).await?;
     import_ldap(client, bundle, &mut mapper).await?;
     import_sso(client, bundle).await?;
-    import_llm(client, bundle).await?;
-    import_collection(client, bundle, &collections::SIEM, &mut mapper, translator).await?;
+    warn_llm_reference(bundle)?;
+    import_collection(
+        client,
+        bundle,
+        &collections::SIEM,
+        &mut mapper,
+        translator,
+        &scopes_by_name,
+    )
+    .await?;
     import_image_registries(client, bundle, &mut mapper).await?;
     import_collection(
         client,
@@ -1363,6 +1745,7 @@ pub async fn import_bundle(
         &collections::EXTERNAL_GROUPS,
         &mut mapper,
         translator,
+        &scopes_by_name,
     )
     .await?;
     import_agent_groups(client, bundle, &mut mapper, translator).await?;
@@ -1375,6 +1758,7 @@ pub async fn import_bundle(
         collections::V3_ONLY,
         &mut mapper,
         translator,
+        &scopes_by_name,
     )
     .await?;
 
@@ -1384,6 +1768,7 @@ pub async fn import_bundle(
         &collections::SCANNER_POLICIES,
         &mut mapper,
         translator,
+        &scopes_by_name,
     )
     .await?;
     import_collection(
@@ -1392,6 +1777,7 @@ pub async fn import_bundle(
         &collections::ASSURANCE_POLICIES,
         &mut mapper,
         translator,
+        &scopes_by_name,
     )
     .await?;
     import_or_skip_v3_only(
@@ -1400,14 +1786,12 @@ pub async fn import_bundle(
         collections::V3_ONLY_LATE,
         &mut mapper,
         translator,
+        &scopes_by_name,
     )
     .await?;
     import_runtime_profiles(client, bundle, &mut mapper, translator).await?;
     import_runtime_policies(client, bundle, &mut mapper, translator).await?;
-    warn_notifications_reference(bundle)?;
-    import_response_policies(client, bundle, &mut mapper, options.strict_notifications).await?;
-    import_custom_reputation_toggle(client, bundle).await?;
-    import_network_reputation(client, bundle).await?;
+    import_response_and_reputation(client, bundle, &mut mapper, options).await?;
 
     Ok(mapper)
 }
@@ -1432,7 +1816,7 @@ mod tests {
         )
     }
     use serde_json::json;
-    use wiremock::matchers::{header, method, path};
+    use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn make_bundle(tmp: &tempfile::TempDir) -> Result<std::path::PathBuf> {
@@ -1593,13 +1977,40 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("PUT"))
             .and(path("/v1/policies/custom-reputation/import"))
-            .and(header("content-type", "application/octet-stream"))
+            // multipart/form-data, not octet-stream: the live endpoint rejects
+            // octet-stream even though the v3 OpenAPI document declares it.
+            .and(wiremock::matchers::header_regex(
+                "content-type",
+                "^multipart/form-data",
+            ))
             .respond_with(ResponseTemplate::new(200))
             .mount(&server)
             .await;
 
         let client = test_client(&server.uri(), ApiVersion::V1)?;
         import_bundle(&client, &bundle, &ImportOptions::default()).await?;
+
+        // Assert the part name and the bytes, not just that a request matched.
+        // The field name was established against the live instance -- "list",
+        // "data" and "reputation" all return `http: no such file` -- so a silent
+        // rename here would break the upload with a 400 that looks like a
+        // content-type problem.
+        let seen = server.received_requests().await.unwrap_or_default();
+        let body = seen
+            .iter()
+            .find(|r| r.url.path() == "/v1/policies/custom-reputation/import")
+            .map(|r| r.body.clone())
+            .ok_or_else(|| anyhow!("the reputation blob should have been uploaded"))?;
+
+        let as_text = String::from_utf8_lossy(&body);
+        assert!(
+            as_text.contains("name=\"file\""),
+            "the file part must be named `file`, got: {as_text:?}"
+        );
+        assert!(
+            body.windows(binary.len()).any(|w| w == binary),
+            "the blob's bytes must survive the multipart encoding intact"
+        );
         Ok(())
     }
 
@@ -1745,7 +2156,17 @@ mod tests {
     // ---- group 6: notifications drop instead of aborting ----
 
     #[tokio::test]
-    async fn response_policy_imports_without_unmappable_notifications() -> Result<()> {
+    async fn a_response_policy_keeps_the_channels_that_do_map() -> Result<()> {
+        // Replaces a group-6 test that asserted the opposite and was wrong: it
+        // expected the policy to be POSTed with an empty notificationSettingsIds,
+        // which the live server rejects with HTTP-002 "failed on the 'required'
+        // tag". Only the partial case is importable.
+        //
+        // Reaching that case needs a notification mapping, which the pipeline
+        // never creates -- channels have no create endpoint, so the "notification"
+        // resource type is never populated. The mapper is seeded directly here to
+        // cover the branch, which is why it stays in the code: it is correct, and
+        // it becomes reachable the day KCS grows a create endpoint for channels.
         let tmp = tempfile::tempdir()?;
         let bundle = make_bundle(&tmp)?;
         std::fs::write(
@@ -1753,24 +2174,18 @@ mod tests {
             serde_json::to_string(&json!([{
                 "id": "src-resp",
                 "name": "page-on-critical",
-                "enabled": false,
-                "notificationSettingsIds": ["chan-a", "chan-b"],
+                "notificationSettingsIds": ["chan-known", "chan-missing"],
             }]))?,
         )?;
 
         let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/v1/policies/response"))
-            .respond_with(ResponseTemplate::new(201).set_body_json(json!({"id": "tgt-resp"})))
-            .mount(&server)
-            .await;
-
+        mount_creates(&server, &[("/v1/policies/response", "tgt-resp")]).await;
         let client = test_client(&server.uri(), ApiVersion::V1)?;
-        let mapper = import_bundle(&client, &bundle, &ImportOptions::default()).await?;
-        assert_eq!(mapper.resolve("response-policy", "src-resp")?, "tgt-resp");
 
-        // The policy was sent, with the unmappable channels removed rather than
-        // passed through as stale source IDs.
+        let mut mapper = IdMapper::new();
+        mapper.register("notification", "chan-known", "tgt-chan");
+        import_response_policies(&client, &bundle, &mut mapper, false, &ScopeIndex::new()).await?;
+
         let seen = server.received_requests().await.unwrap_or_default();
         let body: Value = seen
             .iter()
@@ -1778,7 +2193,12 @@ mod tests {
             .map(|r| serde_json::from_slice(&r.body))
             .transpose()?
             .ok_or_else(|| anyhow!("the response policy should have been POSTed"))?;
-        assert_eq!(body["notificationSettingsIds"], json!([]));
+
+        assert_eq!(
+            body["notificationSettingsIds"],
+            json!(["tgt-chan"]),
+            "the mappable channel is kept; the missing one is dropped with a warning"
+        );
         Ok(())
     }
 
@@ -1943,10 +2363,11 @@ mod tests {
         import_bundle(&client, &bundle, &ImportOptions::default()).await?;
 
         let seen = server.received_requests().await.unwrap_or_default();
-        assert!(
-            !seen.iter().any(|r| r.url.path() == "/v1/security/scopes"),
-            "with no scope file there is nothing to match against, so do not ask"
-        );
+        // The target's scope list IS now read even without a bundle reference
+        // file, because scanner policies carry their scope names inline in
+        // `usedSystemScopes` and can be matched from that alone. What must not
+        // happen is `systemScopes` being rewritten or emptied with no mapping to
+        // rewrite it from -- which is what this test actually guards.
         let body: Value = seen
             .iter()
             .find(|r| r.url.path() == "/v1/policies/assurance")
@@ -2528,7 +2949,7 @@ mod tests {
         )?;
 
         let server = MockServer::start().await;
-        Mock::given(method("POST"))
+        Mock::given(method("PUT"))
             .and(path("/v3/policies/custom-reputation/toggle"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
             .mount(&server)
@@ -2543,8 +2964,15 @@ mod tests {
             .find(|r| r.url.path() == "/v3/policies/custom-reputation/toggle")
             .map(|r| serde_json::from_slice(&r.body))
             .transpose()?
-            .ok_or_else(|| anyhow!("the toggle should have been POSTed"))?;
+            .ok_or_else(|| anyhow!("the toggle should have been PUT"))?;
         assert_eq!(body["enabledList"], json!("kcs-list"));
+        // The verb matters: POST returns 404 on the real server.
+        assert!(
+            seen.iter()
+                .all(|r| !(r.method == wiremock::http::Method::POST
+                    && r.url.path().ends_with("/custom-reputation/toggle"))),
+            "the toggle must be a PUT"
+        );
         Ok(())
     }
 
@@ -2868,6 +3296,422 @@ mod tests {
                 .iter()
                 .any(|r| r.url.path().ends_with("/enable")),
             "a disabled source config must not be switched on"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_v1_bundle_that_already_lists_admission_policies_is_not_split_again() -> Result<()> {
+        // Found by the live round-trip, not by the fixtures. A KCS 2.5 instance
+        // serves /v1/policies/admission-controller through its compatibility
+        // shim, so a bundle exported with --api-version v1 from a 2.5 source
+        // carries admission policies BOTH as their own resource and inline on
+        // every runtime policy. Splitting as well as importing the file created
+        // each policy twice, silently.
+        //
+        // A true 2.4 source has no such route, so its bundle has an empty file
+        // and the split is still what carries the admission controls.
+        let tmp = tempfile::tempdir()?;
+        let bundle = make_bundle(&tmp)?;
+        set_manifest(
+            &bundle,
+            &json!({"bundle_format": 2, "api_version": "v1", "kcs_version": "2.5.0"}),
+        )?;
+        std::fs::write(
+            bundle.join("policies/admission-controller.json"),
+            serde_json::to_string(&json!([{
+                "id": "adm-src", "name": "forensics", "useCapabilityBlock": true,
+                "capabilityBlock": ["CAP_SYS_ADMIN"],
+            }]))?,
+        )?;
+        std::fs::write(
+            bundle.join("policies/runtime.json"),
+            serde_json::to_string(&json!([{
+                "id": "rt-src", "name": "forensics", "useCapabilityBlock": true,
+                "capabilityBlock": ["CAP_SYS_ADMIN"],
+            }]))?,
+        )?;
+
+        let server = MockServer::start().await;
+        mount_creates(
+            &server,
+            &[
+                ("/v3/policies/runtime", "tgt-rt"),
+                ("/v3/policies/admission-controller", "tgt-adm"),
+            ],
+        )
+        .await;
+
+        let client = v3_client(&server.uri())?;
+        import_bundle(&client, &bundle, &ImportOptions::default()).await?;
+
+        let admission_posts = server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|r| r.url.path() == "/v3/policies/admission-controller")
+            .count();
+        assert_eq!(
+            admission_posts, 1,
+            "the explicit admission-controller.json is authoritative; splitting on \
+             top of it duplicates every policy"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_llm_integration_is_never_posted() -> Result<()> {
+        // Found by the live round-trip. Two independent reasons LLM cannot be
+        // replayed, either of which is fatal on its own:
+        //
+        //   1. POST /integrations/llm requires multipart/form-data -- it is a file
+        //      upload. The client only speaks JSON and octet-stream, so the POST
+        //      came back 400 "request Content-Type isn't multipart/form-data" and
+        //      aborted the whole import at step 6, before any policy was replayed.
+        //   2. What GET returns is runtime status -- connectionStatus,
+        //      totalTokensRemain, lastUpdated -- not configuration. There is
+        //      nothing in the bundle that POSTing could usefully restore.
+        //
+        // So it is reference-only now, like notification channels. A write mounted
+        // to fail makes a regression loud rather than silent.
+        let tmp = tempfile::tempdir()?;
+        let bundle = make_bundle(&tmp)?;
+        std::fs::write(
+            bundle.join("integrations/llm.json"),
+            serde_json::to_string(&json!({
+                "id": "llm-1",
+                "type": "kira",
+                "connectionStatus": "success",
+                "dayLimitTokens": 25500,
+            }))?,
+        )?;
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/integrations/llm"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+                "message": "request Content-Type isn't multipart/form-data"
+            })))
+            .mount(&server)
+            .await;
+
+        let client = test_client(&server.uri(), ApiVersion::V1)?;
+        // Must not abort: the whole point is that LLM no longer stops the import.
+        import_bundle(&client, &bundle, &ImportOptions::default()).await?;
+
+        assert!(
+            !server
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .iter()
+                .any(|r| r.url.path() == "/v1/integrations/llm"),
+            "LLM must not be POSTed at all -- the endpoint needs multipart/form-data"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_llm_notice_fires_for_both_bundle_layouts() -> Result<()> {
+        // Regression guard for an inconsistency introduced while making LLM
+        // reference-only: export started writing llm-REFERENCE.json while the
+        // notice still looked for llm.json, so new bundles got no warning at all.
+        for name in ["llm-REFERENCE.json", "llm.json"] {
+            let tmp = tempfile::tempdir()?;
+            let bundle = make_bundle(&tmp)?;
+            std::fs::remove_file(bundle.join("integrations/llm.json")).ok();
+            std::fs::write(
+                bundle.join(format!("integrations/{name}")),
+                serde_json::to_string(&json!({"type": "kira"}))?,
+            )?;
+
+            let server = MockServer::start().await;
+            let client = test_client(&server.uri(), ApiVersion::V1)?;
+            import_bundle(&client, &bundle, &ImportOptions::default()).await?;
+
+            assert!(
+                !server
+                    .received_requests()
+                    .await
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|r| r.url.path().contains("/integrations/llm")),
+                "{name}: LLM must never be requested"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scanner_policy_scopes_are_derived_from_used_system_scopes() -> Result<()> {
+        // Found by the live round-trip. Scanner policies are the one class whose
+        // GET returns `usedSystemScopes` -- an array of {id, name, description}
+        // objects -- and no `systemScopes`, which is the field POST requires.
+        // Replaying the body as exported got
+        //   400 MDW-415 "scopes are empty"  field: systemScopes
+        // and, because scanner policies deliberately do not treat 400 as a skip,
+        // that aborted the whole import at step 14.
+        //
+        // The objects carry their own name, so they can be matched to the target
+        // without needing the bundle's scope reference file at all.
+        let tmp = tempfile::tempdir()?;
+        let bundle = make_bundle(&tmp)?;
+        std::fs::write(
+            bundle.join("policies/scanner.json"),
+            serde_json::to_string(&json!([{
+                "id": "src-scan",
+                "name": "default-scanner",
+                "useVulnerability": true,
+                "usedSystemScopes": [{
+                    "id": "src-scope",
+                    "name": "Default scope",
+                    "description": "All clusters and registries.",
+                }],
+            }]))?,
+        )?;
+
+        let server = MockServer::start().await;
+        // The same scope exists on the target under a different id.
+        Mock::given(method("GET"))
+            .and(path("/v1/security/scopes"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!([{"id": "tgt-scope", "name": "Default scope"}])),
+            )
+            .mount(&server)
+            .await;
+        mount_creates(&server, &[("/v1/policies/scanner", "tgt-scan")]).await;
+
+        let client = test_client(&server.uri(), ApiVersion::V1)?;
+        import_bundle(&client, &bundle, &ImportOptions::default()).await?;
+
+        let seen = server.received_requests().await.unwrap_or_default();
+        let body: Value = seen
+            .iter()
+            .find(|r| r.url.path() == "/v1/policies/scanner")
+            .map(|r| serde_json::from_slice(&r.body))
+            .transpose()?
+            .ok_or_else(|| anyhow!("the scanner policy should have been POSTed"))?;
+
+        assert_eq!(
+            body["systemScopes"],
+            json!(["tgt-scope"]),
+            "systemScopes must be derived and remapped, or the POST is rejected"
+        );
+        assert!(
+            body.get("usedSystemScopes").is_none(),
+            "the read-only mirror must not be sent back"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_rejected_policy_is_skipped_with_the_servers_reason() -> Result<()> {
+        // Found by the live round-trip. Every KCS instance ships a scanner policy
+        // named "default", and it carries no preset marker, so the exporter cannot
+        // tell it apart from a user policy. Re-creating it on any target returns
+        //   400 MDW-355 "scanner policy name already exist"
+        // which previously aborted the import at step 14 -- after thirteen steps
+        // had already written to the target, with no way to resume.
+        //
+        // So a 400 is a skip here too. What stops that hiding a real translation
+        // bug is the warning carrying the server's own message: "scopes are empty"
+        // and "name already exist" read very differently to an operator.
+        let tmp = tempfile::tempdir()?;
+        let bundle = make_bundle(&tmp)?;
+        std::fs::write(
+            bundle.join("policies/scanner.json"),
+            serde_json::to_string(&json!([
+                {"id": "s1", "name": "default", "useVulnerability": true},
+                {"id": "s2", "name": "custom-scan", "useVulnerability": true},
+            ]))?,
+        )?;
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/policies/scanner"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+                "code": "MDW-355",
+                "message": "scanner policy name already exist",
+            })))
+            .mount(&server)
+            .await;
+
+        let client = test_client(&server.uri(), ApiVersion::V1)?;
+        // Must complete: one rejected policy cannot cost the other twenty steps.
+        let mapper = import_bundle(&client, &bundle, &ImportOptions::default()).await?;
+
+        // Neither was created, and neither is claimed as mapped.
+        assert_eq!(mapper.resolve_opt("scanner-policy", "s1"), None);
+        assert_eq!(mapper.resolve_opt("scanner-policy", "s2"), None);
+
+        // Both were attempted -- a skip is per entry, not per collection.
+        let attempts = server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|r| r.url.path() == "/v1/policies/scanner")
+            .count();
+        assert_eq!(attempts, 2, "the second policy must still be tried");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_rejected_runtime_profile_is_skipped_and_its_dependents_still_run() -> Result<()> {
+        // The three importers that do foreign-key work -- runtime profiles,
+        // runtime policies, response policies -- had their own POST handling with
+        // no graceful path, so a single "name already exist" aborted the import at
+        // step 18. They now share one helper with the collection importer, which
+        // is also what stops the four copies drifting apart again.
+        //
+        // The dependent step must still run: a profile that could not be created
+        // is a profile whose ID cannot be resolved, and that is reported where the
+        // reference is rewritten, not by killing the pipeline.
+        let tmp = tempfile::tempdir()?;
+        let bundle = make_bundle(&tmp)?;
+        std::fs::write(
+            bundle.join("policies/runtime-profiles.json"),
+            serde_json::to_string(&json!([{"id": "p1", "name": "busybox"}]))?,
+        )?;
+        std::fs::write(
+            bundle.join("policies/response.json"),
+            serde_json::to_string(&json!([{"id": "r1", "name": "resp"}]))?,
+        )?;
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/policies/runtime-profile"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+                "errors": [{"code": "MDW-399", "message": "name already exist"}]
+            })))
+            .mount(&server)
+            .await;
+        mount_creates(&server, &[("/v1/policies/response", "tgt-resp")]).await;
+
+        let client = test_client(&server.uri(), ApiVersion::V1)?;
+        let mapper = import_bundle(&client, &bundle, &ImportOptions::default()).await?;
+
+        assert_eq!(mapper.resolve_opt("runtime-profile", "p1"), None);
+        // Step 21 still ran, which is the point.
+        assert_eq!(mapper.resolve("response-policy", "r1")?, "tgt-resp");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_response_policy_whose_channels_all_fail_to_map_is_skipped_not_sent() -> Result<()> {
+        // Corrects the group-6 design, which dropped unmappable channels and
+        // POSTed the policy with an empty list. The live server rejects that:
+        //   HTTP-002 "Field validation for 'NotificationSettingsIds' failed on
+        //   the 'required' tag"
+        // Notification channels have no create endpoint, so when every channel a
+        // policy references is unmappable the policy simply cannot exist on the
+        // target. Sending a body we already know is invalid wastes a round trip
+        // and reports the failure as a server complaint rather than as the
+        // missing prerequisite it is.
+        let tmp = tempfile::tempdir()?;
+        let bundle = make_bundle(&tmp)?;
+        std::fs::write(
+            bundle.join("policies/response.json"),
+            serde_json::to_string(&json!([{
+                "id": "r1",
+                "name": "page-on-critical",
+                "notificationSettingsIds": ["chan-a", "chan-b"],
+            }]))?,
+        )?;
+
+        let server = MockServer::start().await;
+        // Mounted to fail loudly: nothing should reach it.
+        Mock::given(method("POST"))
+            .and(path("/v1/policies/response"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let client = test_client(&server.uri(), ApiVersion::V1)?;
+        import_bundle(&client, &bundle, &ImportOptions::default()).await?;
+
+        assert!(
+            !server
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .iter()
+                .any(|r| r.url.path() == "/v1/policies/response"),
+            "a policy that cannot be valid must not be sent"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn response_policy_channels_are_matched_by_name_from_notification_settings() -> Result<()>
+    {
+        // The find that mattered most in the live round-trip. GET returns
+        // `notificationSettings` -- [{id, name, type}] -- while POST requires
+        // `notificationSettingsIds`. Every bit of group-6 notification handling
+        // was keyed on `notificationSettingsIds`, a field the API never returns,
+        // so it never ran and the POST went out without a required field:
+        //   HTTP-002 "Field validation for 'NotificationSettingsIds' failed on
+        //   the 'required' tag"
+        //
+        // Because the inline objects carry names, and the target's channels are
+        // listable by name, the references can be rewritten even though channels
+        // cannot be created. Response policies migrate after all.
+        let tmp = tempfile::tempdir()?;
+        let bundle = make_bundle(&tmp)?;
+        std::fs::write(
+            bundle.join("policies/response.json"),
+            serde_json::to_string(&json!([{
+                "id": "src-resp",
+                "name": "page-on-critical",
+                "notificationSettings": [
+                    {"id": "src-chan", "name": "mailenable", "type": "email"},
+                    {"id": "src-gone", "name": "decommissioned", "type": "email"},
+                ],
+            }]))?,
+        )?;
+
+        let server = MockServer::start().await;
+        // The same channel exists on the target under a different id.
+        Mock::given(method("GET"))
+            .and(path("/v1/integrations/notification-settings/email"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "items": [{"id": "tgt-chan", "name": "mailenable"}]
+            })))
+            .mount(&server)
+            .await;
+        for kind in ["telegram", "webhook"] {
+            Mock::given(method("GET"))
+                .and(path(format!(
+                    "/v1/integrations/notification-settings/{kind}"
+                )))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({"items": []})))
+                .mount(&server)
+                .await;
+        }
+        mount_creates(&server, &[("/v1/policies/response", "tgt-resp")]).await;
+
+        let client = test_client(&server.uri(), ApiVersion::V1)?;
+        let mapper = import_bundle(&client, &bundle, &ImportOptions::default()).await?;
+        assert_eq!(mapper.resolve("response-policy", "src-resp")?, "tgt-resp");
+
+        let seen = server.received_requests().await.unwrap_or_default();
+        let body: Value = seen
+            .iter()
+            .find(|r| r.url.path() == "/v1/policies/response")
+            .map(|r| serde_json::from_slice(&r.body))
+            .transpose()?
+            .ok_or_else(|| anyhow!("the response policy should have been POSTed"))?;
+
+        assert_eq!(
+            body["notificationSettingsIds"],
+            json!(["tgt-chan"]),
+            "the matched channel is remapped to the target's id"
+        );
+        assert!(
+            body.get("notificationSettings").is_none(),
+            "the read-only mirror must not be sent back"
         );
         Ok(())
     }

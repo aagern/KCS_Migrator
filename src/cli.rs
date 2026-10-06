@@ -15,7 +15,7 @@ use std::time::Duration;
 use anyhow::{anyhow, Context, Result};
 use clap::{Args, ValueEnum};
 
-use crate::client::{KcsClient, Timeouts};
+use crate::client::{Connection, KcsClient, Timeouts};
 use crate::version::{ApiVersion, KcsVersion};
 
 /// # Overview
@@ -220,32 +220,22 @@ impl ConnOpts {
     /// client cannot be built, or — in `auto` mode — if detection fails.
     pub async fn connect(&self) -> Result<(KcsClient, Resolved)> {
         let token = resolve_token(self.token.as_deref(), self.token_file.as_deref())?;
-        let verify_tls = !self.no_verify_tls;
-        let timeouts = self.timeouts();
+        let conn = Connection {
+            base_url: &self.url,
+            token: &token,
+            verify_tls: !self.no_verify_tls,
+            host_header: self.host_header.as_deref(),
+            timeouts: self.timeouts(),
+        };
 
         // An explicit --api-version must send nothing at all: the override exists
         // for instances where detection cannot work, so one that still depended on
         // a request would be useless in exactly the case it is meant for.
         if let Some(api) = self.api_version.pinned() {
-            let client = KcsClient::new(
-                &self.url,
-                &token,
-                verify_tls,
-                self.host_header.as_deref(),
-                api,
-                timeouts,
-            )?;
-            return Ok((client, Resolved::Pinned(api)));
+            return Ok((KcsClient::new(&conn, api)?, Resolved::Pinned(api)));
         }
 
-        let (client, found) = KcsClient::detect(
-            &self.url,
-            &token,
-            verify_tls,
-            self.host_header.as_deref(),
-            timeouts,
-        )
-        .await?;
+        let (client, found) = KcsClient::detect(&conn).await?;
         Ok((client, Resolved::Detected(found)))
     }
 }

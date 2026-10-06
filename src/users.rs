@@ -36,6 +36,21 @@ const SQL: &str = "SELECT username, COALESCE(email,''), COALESCE(display_name,''
 /// for this module used to re-implement this loop inline, which meant they
 /// asserted on a copy of the logic and would have passed no matter what
 /// the shipped function did.
+///
+/// # Examples
+///
+/// ```
+/// use kcs_migrator::users;
+///
+/// let raw = "admin||Admin|[\"admin\"]|local|local|true\n\
+///            broken|b@corp.com|Broken|[\"viewer\"]|local|local\n";
+/// let (users, skipped) = users::parse_psql_rows(raw);
+///
+/// assert_eq!(users.len(), 1);
+/// assert_eq!(users[0]["username"], "admin");
+/// // The six-column row is reported, not silently dropped.
+/// assert_eq!(skipped, 1);
+/// ```
 #[must_use]
 pub fn parse_psql_rows(stdout: &str) -> (Vec<Value>, usize) {
     let mut users = Vec::new();

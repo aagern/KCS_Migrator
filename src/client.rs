@@ -93,6 +93,30 @@ pub fn is_client_error(e: &anyhow::Error) -> bool {
     error_status(e).is_some_and(|s| s.is_client_error())
 }
 
+/// # Overview
+///
+/// Everything needed to reach one KCS instance.
+///
+/// Grouped into a struct because the constructor took six arguments, two
+/// of which — `base_url` and `token` — are both `&str` and adjacent.
+/// Transposing them compiles cleanly and then sends the URL as the
+/// credential, which fails with a confusing "login failed" rather than
+/// anything that points at the mistake. Named fields make that
+/// unexpressible.
+#[derive(Debug, Clone, Copy)]
+pub struct Connection<'a> {
+    /// Base URL including `/api`, without a version segment.
+    pub base_url: &'a str,
+    /// API token for the `Tron-Token` header.
+    pub token: &'a str,
+    /// Whether to verify the server's TLS certificate.
+    pub verify_tls: bool,
+    /// Optional `Host` header override, for reaching an ingress by IP.
+    pub host_header: Option<&'a str>,
+    /// Request deadlines.
+    pub timeouts: Timeouts,
+}
+
 /// What a single `healthz` probe told us.
 ///
 /// Distinguishing these is what lets [`KcsClient::detect`] give a useful
@@ -141,26 +165,20 @@ pub struct KcsClient {
 ///
 /// Returns an error if `token` or `host_header` contain bytes that are
 /// not valid in an HTTP header, or if [`reqwest::Client`] fails to build.
-fn build_http(
-    base_url: &str,
-    token: &str,
-    verify_tls: bool,
-    host_header: Option<&str>,
-    timeouts: Timeouts,
-) -> Result<reqwest::Client> {
+fn build_http(conn: &Connection<'_>) -> Result<reqwest::Client> {
     let mut default_headers = HeaderMap::new();
-    default_headers.insert("Tron-Token", HeaderValue::from_str(token)?);
-    if let Some(host) = host_header {
+    default_headers.insert("Tron-Token", HeaderValue::from_str(conn.token)?);
+    if let Some(host) = conn.host_header {
         default_headers.insert("Host", HeaderValue::from_str(host)?);
     }
 
     reqwest::Client::builder()
-        .danger_accept_invalid_certs(!verify_tls)
+        .danger_accept_invalid_certs(!conn.verify_tls)
         .default_headers(default_headers)
-        .connect_timeout(timeouts.connect)
-        .timeout(timeouts.request)
+        .connect_timeout(conn.timeouts.connect)
+        .timeout(conn.timeouts.request)
         .build()
-        .with_context(|| format!("failed to build HTTP client for {base_url}"))
+        .with_context(|| format!("failed to build HTTP client for {}", conn.base_url))
 }
 
 /// Sends one `GET {base}{prefix}/healthz` and classifies the result.
@@ -231,17 +249,10 @@ impl KcsClient {
     /// Returns an error if `token` or `host_header` contain bytes that
     /// are not valid in an HTTP header, or if [`reqwest::Client`] fails
     /// to build (e.g. an invalid TLS configuration on the host).
-    pub fn new(
-        base_url: &str,
-        token: &str,
-        verify_tls: bool,
-        host_header: Option<&str>,
-        api: ApiVersion,
-        timeouts: Timeouts,
-    ) -> Result<Self> {
-        let http = build_http(base_url, token, verify_tls, host_header, timeouts)?;
+    pub fn new(conn: &Connection<'_>, api: ApiVersion) -> Result<Self> {
+        let http = build_http(conn)?;
         Ok(Self {
-            base: base_url.trim_end_matches('/').to_string(),
+            base: conn.base_url.trim_end_matches('/').to_string(),
             api,
             http,
             dry_run: false,
@@ -272,15 +283,9 @@ impl KcsClient {
     /// reached, or [`VersionError::Undetectable`] — whose message names
     /// the `--api-version` override — if no generation reported a
     /// version.
-    pub async fn detect(
-        base_url: &str,
-        token: &str,
-        verify_tls: bool,
-        host_header: Option<&str>,
-        timeouts: Timeouts,
-    ) -> Result<(Self, KcsVersion)> {
-        let http = build_http(base_url, token, verify_tls, host_header, timeouts)?;
-        let base = base_url.trim_end_matches('/').to_string();
+    pub async fn detect(conn: &Connection<'_>) -> Result<(Self, KcsVersion)> {
+        let http = build_http(conn)?;
+        let base = conn.base_url.trim_end_matches('/').to_string();
 
         for prefix in [ApiVersion::V1.prefix(), ApiVersion::V3.prefix()] {
             match probe_healthz(&http, &base, prefix).await {
@@ -523,13 +528,17 @@ impl KcsClient {
     /// every use of its URL — but the borrow is still real:
     ///
     /// ```
-    /// use kcs_migrator::client::{KcsClient, Timeouts};
+    /// use kcs_migrator::client::{Connection, KcsClient, Timeouts};
     /// use kcs_migrator::version::ApiVersion;
     ///
-    /// let client = KcsClient::new(
-    ///     "https://kcs.demo.lab/api/", "tok", true, None,
-    ///     ApiVersion::V3, Timeouts::default(),
-    /// ).unwrap();
+    /// let conn = Connection {
+    ///     base_url: "https://kcs.demo.lab/api/",
+    ///     token: "tok",
+    ///     verify_tls: true,
+    ///     host_header: None,
+    ///     timeouts: Timeouts::default(),
+    /// };
+    /// let client = KcsClient::new(&conn, ApiVersion::V3).unwrap();
     ///
     /// // Borrowed, trailing slash stripped, no version segment.
     /// assert_eq!(client.base_url(), "https://kcs.demo.lab/api");
@@ -579,7 +588,38 @@ mod tests {
 
     /// A V1 client with default timeouts, for the transport tests.
     fn v1_client(uri: &str, token: &str) -> Result<KcsClient> {
-        KcsClient::new(uri, token, true, None, ApiVersion::V1, Timeouts::default())
+        client_with(uri, token, ApiVersion::V1, None, Timeouts::default())
+    }
+
+    /// A client with every knob spelled out, for the tests that vary one.
+    fn client_with(
+        uri: &str,
+        token: &str,
+        api: ApiVersion,
+        host_header: Option<&str>,
+        timeouts: Timeouts,
+    ) -> Result<KcsClient> {
+        KcsClient::new(
+            &Connection {
+                base_url: uri,
+                token,
+                verify_tls: true,
+                host_header,
+                timeouts,
+            },
+            api,
+        )
+    }
+
+    /// A `Connection` for the detection tests.
+    fn conn(uri: &str) -> Connection<'_> {
+        Connection {
+            base_url: uri,
+            token: "tok",
+            verify_tls: true,
+            host_header: None,
+            timeouts: Timeouts::default(),
+        }
     }
 
     #[tokio::test]
@@ -678,12 +718,11 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = KcsClient::new(
+        let client = client_with(
             &server.uri(),
             "tok",
-            true,
-            None,
             ApiVersion::V3,
+            None,
             Timeouts::default(),
         )?;
         // The same relative path the V1 test uses — only the client differs.
@@ -709,12 +748,11 @@ mod tests {
 
     #[test]
     fn base_url_keeps_no_version_segment_and_no_trailing_slash() -> Result<()> {
-        let client = KcsClient::new(
+        let client = client_with(
             "https://kcs.demo.lab/api/",
             "tok",
-            true,
-            None,
             ApiVersion::V3,
+            None,
             Timeouts::default(),
         )?;
         assert_eq!(client.base_url(), "https://kcs.demo.lab/api");
@@ -745,8 +783,7 @@ mod tests {
         let server = MockServer::start().await;
         mount_healthz(&server, "/v1", 200, Some(json!({"version": "2.5.0"}))).await;
 
-        let (client, found) =
-            KcsClient::detect(&server.uri(), "tok", true, None, Timeouts::default()).await?;
+        let (client, found) = KcsClient::detect(&conn(&server.uri())).await?;
         assert_eq!(found, KcsVersion::new(2, 5, 0));
         assert_eq!(client.api_version(), ApiVersion::V3);
         Ok(())
@@ -757,8 +794,7 @@ mod tests {
         let server = MockServer::start().await;
         mount_healthz(&server, "/v1", 200, Some(json!({"version": "2.4.1"}))).await;
 
-        let (client, found) =
-            KcsClient::detect(&server.uri(), "tok", true, None, Timeouts::default()).await?;
+        let (client, found) = KcsClient::detect(&conn(&server.uri())).await?;
         assert_eq!(found, KcsVersion::new(2, 4, 1));
         assert_eq!(client.api_version(), ApiVersion::V1);
         Ok(())
@@ -771,8 +807,7 @@ mod tests {
         mount_healthz(&server, "/v1", 404, None).await;
         mount_healthz(&server, "/v3", 200, Some(json!({"version": "2.6.0"}))).await;
 
-        let (client, found) =
-            KcsClient::detect(&server.uri(), "tok", true, None, Timeouts::default()).await?;
+        let (client, found) = KcsClient::detect(&conn(&server.uri())).await?;
         assert_eq!(found, KcsVersion::new(2, 6, 0));
         assert_eq!(client.api_version(), ApiVersion::V3);
         Ok(())
@@ -784,7 +819,7 @@ mod tests {
         mount_healthz(&server, "/v1", 404, None).await;
         mount_healthz(&server, "/v3", 404, None).await;
 
-        let err = KcsClient::detect(&server.uri(), "tok", true, None, Timeouts::default())
+        let err = KcsClient::detect(&conn(&server.uri()))
             .await
             .expect_err("both probes 404, detection must fail");
         let rendered = format!("{err}");
@@ -808,7 +843,7 @@ mod tests {
         )
         .await;
 
-        let err = KcsClient::detect(&server.uri(), "tok", true, None, Timeouts::default())
+        let err = KcsClient::detect(&conn(&server.uri()))
             .await
             .expect_err("a rejected token must fail detection");
         let rendered = format!("{err}");
@@ -851,12 +886,11 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = KcsClient::new(
+        let client = client_with(
             &server.uri(),
             "tok",
-            true,
-            None,
             ApiVersion::V1,
+            None,
             Timeouts {
                 connect: Duration::from_millis(500),
                 request: Duration::from_millis(150),
@@ -892,12 +926,11 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = KcsClient::new(
+        let client = client_with(
             &server.uri(),
             "tok",
-            true,
-            Some("kcs.demo.lab"),
             ApiVersion::V1,
+            Some("kcs.demo.lab"),
             Timeouts::default(),
         )?;
         client.get("/healthz").await?;

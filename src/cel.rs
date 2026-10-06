@@ -97,6 +97,22 @@ fn slug_for(item: &Value) -> String {
 /// with a Windows prefix or root component. Rejecting rather than
 /// sanitising is deliberate: a pointer that needed rewriting to be safe
 /// is a pointer nobody intended, so the operator should see it.
+///
+/// # Examples
+///
+/// ```
+/// use kcs_migrator::cel;
+/// use std::path::Path;
+///
+/// let bundle = Path::new("/tmp/kcs-export-x");
+/// let ok = cel::resolve_path(bundle, "CEL/benchmark/control/CTRL-1.cel")?;
+/// assert!(ok.starts_with(bundle));
+///
+/// // A bundle is hand-editable before import, so its paths are untrusted.
+/// assert!(cel::resolve_path(bundle, "../../etc/passwd").is_err());
+/// assert!(cel::resolve_path(bundle, "/etc/passwd").is_err());
+/// # Ok::<(), anyhow::Error>(())
+/// ```
 pub fn resolve_path(bundle: &Path, rel: &str) -> Result<PathBuf> {
     let candidate = Path::new(rel);
     if candidate.is_absolute() {
@@ -154,6 +170,11 @@ pub fn extract(items: &mut Value, bundle: &Path, rel_dir: &str) -> Result<usize>
         let rule = rule.to_string();
 
         let stem = slug_for(item);
+        // `entry` needs an owned key, so this clones the stem once per entry even
+        // when the key is already present. That is deliberate: avoiding it means
+        // a `get_mut`/`insert` pair, which clippy flags and whose suggested
+        // rewrite does not compile (the closure would borrow `used` a second
+        // time). One short String per control is not worth that.
         let seen = used.entry(stem.clone()).or_insert(0);
         *seen += 1;
         let file_stem = if *seen == 1 {

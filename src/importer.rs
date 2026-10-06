@@ -425,7 +425,7 @@ async fn import_collection(
         cel::inline(&mut items, bundle)?;
     }
 
-    let Some(arr) = items.as_array().cloned() else {
+    let Value::Array(arr) = items else {
         return Ok(0);
     };
     let mut created = 0;
@@ -477,8 +477,10 @@ async fn import_or_skip_v3_only(
     group: &[PolicyCollection<'_>],
     mapper: &mut IdMapper,
     translator: Translator,
-    target_is_v3: bool,
 ) -> Result<()> {
+    // Asked of the client rather than passed in: one source of truth, and one
+    // fewer `bool` parameter at a call site that already has five.
+    let target_is_v3 = client.api_version() == ApiVersion::V3;
     for collection in group {
         if target_is_v3 {
             import_collection(client, bundle, collection, mapper, translator).await?;
@@ -671,10 +673,11 @@ async fn import_image_registries(
     bundle: &Path,
     mapper: &mut IdMapper,
 ) -> Result<()> {
-    let registries = read_json(&bundle.join("integrations/image-registries.json"))?;
-    let arr = match registries.as_array() {
-        Some(a) => a.clone(),
-        None => return Ok(()),
+    // `let Value::Array(arr)` *moves* the Vec out of the parsed value instead of
+    // cloning it. `as_array()` would hand back a `&Vec<Value>` and the old code
+    // cloned it — a deep copy of every policy body in the file, for nothing.
+    let Value::Array(arr) = read_json(&bundle.join("integrations/image-registries.json"))? else {
+        return Ok(());
     };
 
     for reg in &arr {
@@ -722,10 +725,8 @@ async fn import_agent_groups(
     mapper: &mut IdMapper,
     translator: Translator,
 ) -> Result<()> {
-    let groups = read_json(&bundle.join("integrations/agent-groups.json"))?;
-    let arr = match groups.as_array() {
-        Some(a) => a.clone(),
-        None => return Ok(()),
+    let Value::Array(arr) = read_json(&bundle.join("integrations/agent-groups.json"))? else {
+        return Ok(());
     };
 
     for group in &arr {
@@ -902,10 +903,8 @@ async fn import_runtime_profiles(
     mapper: &mut IdMapper,
     translator: Translator,
 ) -> Result<()> {
-    let profiles = read_json(&bundle.join("policies/runtime-profiles.json"))?;
-    let arr = match profiles.as_array() {
-        Some(a) => a.clone(),
-        None => return Ok(()),
+    let Value::Array(arr) = read_json(&bundle.join("policies/runtime-profiles.json"))? else {
+        return Ok(());
     };
 
     for profile in &arr {
@@ -948,10 +947,8 @@ async fn import_runtime_policies(
     mapper: &mut IdMapper,
     translator: Translator,
 ) -> Result<()> {
-    let policies = read_json(&bundle.join("policies/runtime.json"))?;
-    let arr = match policies.as_array() {
-        Some(a) => a.clone(),
-        None => return Ok(()),
+    let Value::Array(arr) = read_json(&bundle.join("policies/runtime.json"))? else {
+        return Ok(());
     };
 
     for pol in &arr {
@@ -1148,10 +1145,8 @@ async fn import_response_policies(
     mapper: &mut IdMapper,
     strict: bool,
 ) -> Result<()> {
-    let policies = read_json(&bundle.join("policies/response.json"))?;
-    let arr = match policies.as_array() {
-        Some(a) => a.clone(),
-        None => return Ok(()),
+    let Value::Array(arr) = read_json(&bundle.join("policies/response.json"))? else {
+        return Ok(());
     };
 
     for pol in &arr {
@@ -1299,14 +1294,19 @@ async fn import_network_reputation(client: &KcsClient, bundle: &Path) -> Result<
 /// # Examples
 ///
 /// ```no_run
-/// use kcs_migrator::client::{KcsClient, Timeouts};
+/// use kcs_migrator::client::{Connection, KcsClient, Timeouts};
 /// use kcs_migrator::importer;
 /// use std::path::Path;
 ///
 /// # async fn run() -> anyhow::Result<()> {
-/// let (client, _kcs) = KcsClient::detect(
-///     "https://kcs.tgt.corp", "tok", true, None, Timeouts::default(),
-/// ).await?;
+/// let (client, _kcs) = KcsClient::detect(&Connection {
+///     base_url: "https://kcs.tgt.corp",
+///     token: "tok",
+///     verify_tls: true,
+///     host_header: None,
+///     timeouts: Timeouts::default(),
+/// })
+/// .await?;
 /// let mapper = importer::import_bundle(
 ///     &client, Path::new("kcs-export-…"), &importer::ImportOptions::default(),
 /// ).await?;
@@ -1369,14 +1369,12 @@ pub async fn import_bundle(
 
     // The KCS 2.5 resource classes. On an `APIv1` target they are skipped without
     // a request: 2.4 has no route for them, and a 404 would abort the import.
-    let target_is_v3 = client.api_version() == ApiVersion::V3;
     import_or_skip_v3_only(
         client,
         bundle,
         collections::V3_ONLY,
         &mut mapper,
         translator,
-        target_is_v3,
     )
     .await?;
 
@@ -1402,7 +1400,6 @@ pub async fn import_bundle(
         collections::V3_ONLY_LATE,
         &mut mapper,
         translator,
-        target_is_v3,
     )
     .await?;
     import_runtime_profiles(client, bundle, &mut mapper, translator).await?;
@@ -1418,8 +1415,22 @@ pub async fn import_bundle(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::client::Timeouts;
+    use crate::client::{Connection, Timeouts};
     use crate::version::ApiVersion;
+
+    /// A client for `uri` pinned to `api`, with default timeouts.
+    fn test_client(uri: &str, api: ApiVersion) -> Result<KcsClient> {
+        KcsClient::new(
+            &Connection {
+                base_url: uri,
+                token: "tok",
+                verify_tls: true,
+                host_header: None,
+                timeouts: Timeouts::default(),
+            },
+            api,
+        )
+    }
     use serde_json::json;
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -1480,14 +1491,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = KcsClient::new(
-            &server.uri(),
-            "tok",
-            true,
-            None,
-            ApiVersion::V1,
-            Timeouts::default(),
-        )?;
+        let client = test_client(&server.uri(), ApiVersion::V1)?;
         let mapper = import_bundle(&client, &bundle, &ImportOptions::default()).await?;
         assert_eq!(mapper.resolve("scanner-policy", "pol-src-1")?, "pol-tgt-99");
         Ok(())
@@ -1521,14 +1525,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = KcsClient::new(
-            &server.uri(),
-            "tok",
-            true,
-            None,
-            ApiVersion::V1,
-            Timeouts::default(),
-        )?;
+        let client = test_client(&server.uri(), ApiVersion::V1)?;
         let mapper = import_bundle(&client, &bundle, &ImportOptions::default()).await?;
         assert_eq!(mapper.resolve("runtime-profile", "rp-src-1")?, "rp-tgt-1");
         assert_eq!(mapper.resolve("runtime-policy", "rt-src-1")?, "rt-tgt-1");
@@ -1548,14 +1545,7 @@ mod tests {
         )?;
 
         let server = MockServer::start().await;
-        let client = KcsClient::new(
-            &server.uri(),
-            "tok",
-            true,
-            None,
-            ApiVersion::V1,
-            Timeouts::default(),
-        )?;
+        let client = test_client(&server.uri(), ApiVersion::V1)?;
         let err = import_bundle(&client, &bundle, &ImportOptions::default())
             .await
             .unwrap_err();
@@ -1581,14 +1571,7 @@ mod tests {
         )?;
 
         let server = MockServer::start().await;
-        let client = KcsClient::new(
-            &server.uri(),
-            "tok",
-            true,
-            None,
-            ApiVersion::V1,
-            Timeouts::default(),
-        )?;
+        let client = test_client(&server.uri(), ApiVersion::V1)?;
         let err = import_bundle(&client, &bundle, &strict).await.unwrap_err();
         // Complements strict_notifications_restores_the_abort: that one checks the
         // policy name and the flag name, this one checks the offending channel ID
@@ -1615,14 +1598,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = KcsClient::new(
-            &server.uri(),
-            "tok",
-            true,
-            None,
-            ApiVersion::V1,
-            Timeouts::default(),
-        )?;
+        let client = test_client(&server.uri(), ApiVersion::V1)?;
         import_bundle(&client, &bundle, &ImportOptions::default()).await?;
         Ok(())
     }
@@ -1657,14 +1633,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = KcsClient::new(
-            &server.uri(),
-            "tok",
-            true,
-            None,
-            ApiVersion::V1,
-            Timeouts::default(),
-        )?;
+        let client = test_client(&server.uri(), ApiVersion::V1)?;
         let mapper = import_bundle(&client, &bundle, &ImportOptions::default()).await?;
         assert!(mapper.resolve("image-registry", "reg-cred-1").is_err());
         assert_eq!(
@@ -1697,14 +1666,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = KcsClient::new(
-            &server.uri(),
-            "tok",
-            true,
-            None,
-            ApiVersion::V1,
-            Timeouts::default(),
-        )?;
+        let client = test_client(&server.uri(), ApiVersion::V1)?;
         let mapper = import_bundle(&client, &bundle, &ImportOptions::default()).await?;
         assert_eq!(mapper.resolve("image-registry", "reg-src-1")?, "reg-tgt-1");
         Ok(())
@@ -1735,14 +1697,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = KcsClient::new(
-            &server.uri(),
-            "tok",
-            true,
-            None,
-            ApiVersion::V1,
-            Timeouts::default(),
-        )?;
+        let client = test_client(&server.uri(), ApiVersion::V1)?;
         let mapper = import_bundle(&client, &bundle, &ImportOptions::default()).await?;
         assert_eq!(mapper.resolve("ldap", "src-ldap")?, "tgt-ldap");
 
@@ -1776,14 +1731,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = KcsClient::new(
-            &server.uri(),
-            "tok",
-            true,
-            None,
-            ApiVersion::V1,
-            Timeouts::default(),
-        )?;
+        let client = test_client(&server.uri(), ApiVersion::V1)?;
         import_bundle(&client, &bundle, &ImportOptions::default()).await?;
 
         let seen = server.received_requests().await.unwrap_or_default();
@@ -1817,14 +1765,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = KcsClient::new(
-            &server.uri(),
-            "tok",
-            true,
-            None,
-            ApiVersion::V1,
-            Timeouts::default(),
-        )?;
+        let client = test_client(&server.uri(), ApiVersion::V1)?;
         let mapper = import_bundle(&client, &bundle, &ImportOptions::default()).await?;
         assert_eq!(mapper.resolve("response-policy", "src-resp")?, "tgt-resp");
 
@@ -1855,14 +1796,7 @@ mod tests {
         )?;
 
         let server = MockServer::start().await;
-        let client = KcsClient::new(
-            &server.uri(),
-            "tok",
-            true,
-            None,
-            ApiVersion::V1,
-            Timeouts::default(),
-        )?;
+        let client = test_client(&server.uri(), ApiVersion::V1)?;
         let options = ImportOptions {
             strict_notifications: true,
             ..ImportOptions::default()
@@ -1925,14 +1859,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = KcsClient::new(
-            &server.uri(),
-            "tok",
-            true,
-            None,
-            ApiVersion::V1,
-            Timeouts::default(),
-        )?;
+        let client = test_client(&server.uri(), ApiVersion::V1)?;
         import_bundle(&client, &bundle, &ImportOptions::default()).await?;
 
         let seen = server.received_requests().await.unwrap_or_default();
@@ -1978,14 +1905,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = KcsClient::new(
-            &server.uri(),
-            "tok",
-            true,
-            None,
-            ApiVersion::V1,
-            Timeouts::default(),
-        )?;
+        let client = test_client(&server.uri(), ApiVersion::V1)?;
         import_bundle(&client, &bundle, &ImportOptions::default()).await?;
 
         let seen = server.received_requests().await.unwrap_or_default();
@@ -2019,14 +1939,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = KcsClient::new(
-            &server.uri(),
-            "tok",
-            true,
-            None,
-            ApiVersion::V1,
-            Timeouts::default(),
-        )?;
+        let client = test_client(&server.uri(), ApiVersion::V1)?;
         import_bundle(&client, &bundle, &ImportOptions::default()).await?;
 
         let seen = server.received_requests().await.unwrap_or_default();
@@ -2065,14 +1978,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = KcsClient::new(
-            &server.uri(),
-            "tok",
-            true,
-            None,
-            ApiVersion::V1,
-            Timeouts::default(),
-        )?;
+        let client = test_client(&server.uri(), ApiVersion::V1)?;
         let err = import_bundle(&client, &bundle, &ImportOptions::default())
             .await
             .expect_err("a create with no id must abort");
@@ -2107,14 +2013,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = KcsClient::new(
-            &server.uri(),
-            "tok",
-            true,
-            None,
-            ApiVersion::V1,
-            Timeouts::default(),
-        )?;
+        let client = test_client(&server.uri(), ApiVersion::V1)?;
         let mapper = import_bundle(&client, &bundle, &ImportOptions::default()).await?;
 
         assert_eq!(mapper.resolve("runtime-profile", "has-id")?, "tgt");
@@ -2148,14 +2047,7 @@ mod tests {
         std::fs::remove_file(bundle.join("manifest.json"))?;
 
         let server = MockServer::start().await;
-        let client = KcsClient::new(
-            &server.uri(),
-            "tok",
-            true,
-            None,
-            ApiVersion::V1,
-            Timeouts::default(),
-        )?;
+        let client = test_client(&server.uri(), ApiVersion::V1)?;
         let err = import_bundle(&client, &bundle, &ImportOptions::default())
             .await
             .expect_err("a manifest-less directory must be refused");
@@ -2189,14 +2081,7 @@ mod tests {
         )?;
 
         let server = MockServer::start().await;
-        let client = KcsClient::new(
-            &server.uri(),
-            "tok",
-            true,
-            None,
-            ApiVersion::V1,
-            Timeouts::default(),
-        )?;
+        let client = test_client(&server.uri(), ApiVersion::V1)?;
         let options = ImportOptions {
             target_kcs: Some(KcsVersion::new(2, 4, 1)),
             ..ImportOptions::default()
@@ -2232,14 +2117,7 @@ mod tests {
         )?;
 
         let server = MockServer::start().await;
-        let client = KcsClient::new(
-            &server.uri(),
-            "tok",
-            true,
-            None,
-            ApiVersion::V1,
-            Timeouts::default(),
-        )?;
+        let client = test_client(&server.uri(), ApiVersion::V1)?;
         import_bundle(&client, &bundle, &ImportOptions::default()).await?;
         Ok(())
     }
@@ -2281,14 +2159,7 @@ mod tests {
             .await;
 
         // A V3 client against a V1 bundle: the only combination that translates.
-        let client = KcsClient::new(
-            &server.uri(),
-            "tok",
-            true,
-            None,
-            ApiVersion::V3,
-            Timeouts::default(),
-        )?;
+        let client = test_client(&server.uri(), ApiVersion::V3)?;
         let options = ImportOptions {
             target_kcs: Some(KcsVersion::new(2, 5, 0)),
             ..ImportOptions::default()
@@ -2345,14 +2216,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = KcsClient::new(
-            &server.uri(),
-            "tok",
-            true,
-            None,
-            ApiVersion::V3,
-            Timeouts::default(),
-        )?;
+        let client = test_client(&server.uri(), ApiVersion::V3)?;
         import_bundle(&client, &bundle, &ImportOptions::default()).await?;
 
         let seen = server.received_requests().await.unwrap_or_default();
@@ -2395,14 +2259,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = KcsClient::new(
-            &server.uri(),
-            "tok",
-            true,
-            None,
-            ApiVersion::V3,
-            Timeouts::default(),
-        )?;
+        let client = test_client(&server.uri(), ApiVersion::V3)?;
         import_bundle(&client, &bundle, &ImportOptions::default()).await?;
 
         let seen = server.received_requests().await.unwrap_or_default();
@@ -2442,14 +2299,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = KcsClient::new(
-            &server.uri(),
-            "tok",
-            true,
-            None,
-            ApiVersion::V3,
-            Timeouts::default(),
-        )?;
+        let client = test_client(&server.uri(), ApiVersion::V3)?;
         import_bundle(&client, &bundle, &ImportOptions::default()).await?;
 
         let seen = server.received_requests().await.unwrap_or_default();
@@ -2500,7 +2350,7 @@ mod tests {
     }
 
     fn v3_client(uri: &str) -> Result<KcsClient> {
-        KcsClient::new(uri, "tok", true, None, ApiVersion::V3, Timeouts::default())
+        test_client(uri, ApiVersion::V3)
     }
 
     #[tokio::test]
@@ -2839,14 +2689,7 @@ mod tests {
         )?;
 
         let server = MockServer::start().await;
-        let client = KcsClient::new(
-            &server.uri(),
-            "tok",
-            true,
-            None,
-            ApiVersion::V1,
-            Timeouts::default(),
-        )?;
+        let client = test_client(&server.uri(), ApiVersion::V1)?;
         import_bundle(&client, &bundle, &ImportOptions::default()).await?;
 
         let seen = server.received_requests().await.unwrap_or_default();
@@ -2986,14 +2829,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = KcsClient::new(
-            &server.uri(),
-            "tok",
-            true,
-            None,
-            ApiVersion::V1,
-            Timeouts::default(),
-        )?;
+        let client = test_client(&server.uri(), ApiVersion::V1)?;
         import_bundle(&client, &bundle, &ImportOptions::default()).await?;
 
         let seen = server.received_requests().await.unwrap_or_default();
@@ -3021,14 +2857,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = KcsClient::new(
-            &server.uri(),
-            "tok",
-            true,
-            None,
-            ApiVersion::V1,
-            Timeouts::default(),
-        )?;
+        let client = test_client(&server.uri(), ApiVersion::V1)?;
         import_bundle(&client, &bundle, &ImportOptions::default()).await?;
 
         assert!(

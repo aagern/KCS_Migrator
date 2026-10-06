@@ -66,21 +66,28 @@
 //! # Examples
 //!
 //! ```no_run
-//! use kcs_migrator::client::{KcsClient, Timeouts};
+//! use kcs_migrator::client::{Connection, KcsClient, Timeouts};
 //! use kcs_migrator::{export, importer};
 //! use std::path::Path;
 //!
 //! # async fn run() -> anyhow::Result<()> {
 //! // `detect` probes the instance's release and pins the client to the
 //! // matching API generation.
-//! let (source, src_kcs) = KcsClient::detect(
-//!     "https://kcs.src.corp", "tok", true, None, Timeouts::default(),
-//! ).await?;
+//! let src = Connection {
+//!     base_url: "https://kcs.src.corp",
+//!     token: "tok",
+//!     verify_tls: true,
+//!     host_header: None,
+//!     timeouts: Timeouts::default(),
+//! };
+//! let (source, src_kcs) = KcsClient::detect(&src).await?;
 //! let bundle = export::export_all(&source, Path::new("."), Some(src_kcs)).await?;
 //!
-//! let (target, tgt_kcs) = KcsClient::detect(
-//!     "https://kcs.tgt.corp", "tok", true, None, Timeouts::default(),
-//! ).await?;
+//! let (target, tgt_kcs) = KcsClient::detect(&Connection {
+//!     base_url: "https://kcs.tgt.corp",
+//!     ..src
+//! })
+//! .await?;
 //! println!("migrating KCS {src_kcs} → KCS {tgt_kcs}");
 //! let mapper = importer::import_bundle(
 //!     &target, &bundle, &importer::ImportOptions::default(),

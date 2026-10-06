@@ -206,14 +206,19 @@ async fn get_list_detailed(
 /// # Examples
 ///
 /// ```no_run
-/// use kcs_migrator::client::{KcsClient, Timeouts};
+/// use kcs_migrator::client::{Connection, KcsClient, Timeouts};
 /// use kcs_migrator::export;
 /// use std::path::Path;
 ///
 /// # async fn run() -> anyhow::Result<()> {
-/// let (client, kcs) = KcsClient::detect(
-///     "https://kcs.src.corp", "tok", true, None, Timeouts::default(),
-/// ).await?;
+/// let (client, kcs) = KcsClient::detect(&Connection {
+///     base_url: "https://kcs.src.corp",
+///     token: "tok",
+///     verify_tls: true,
+///     host_header: None,
+///     timeouts: Timeouts::default(),
+/// })
+/// .await?;
 /// println!("source is KCS {kcs}, speaking {:?}", client.api_version());
 /// let bundle = export::export_all(&client, Path::new("."), Some(kcs)).await?;
 /// println!("bundle: {}", bundle.display());
@@ -707,8 +712,22 @@ fn write_manifest(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::client::Timeouts;
+    use crate::client::{Connection, Timeouts};
     use crate::version::ApiVersion;
+
+    /// A client for `uri` pinned to `api`, with default timeouts.
+    fn test_client(uri: &str, api: ApiVersion) -> Result<KcsClient> {
+        KcsClient::new(
+            &Connection {
+                base_url: uri,
+                token: "tok",
+                verify_tls: true,
+                host_header: None,
+                timeouts: Timeouts::default(),
+            },
+            api,
+        )
+    }
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -771,14 +790,7 @@ mod tests {
         stub_empty(&server).await;
 
         let tmp = tempfile::tempdir()?;
-        let client = KcsClient::new(
-            &server.uri(),
-            "tok",
-            true,
-            None,
-            ApiVersion::V1,
-            Timeouts::default(),
-        )?;
+        let client = test_client(&server.uri(), ApiVersion::V1)?;
         let bundle = export_all(&client, tmp.path(), None).await?;
 
         let data: Value = serde_json::from_str(&std::fs::read_to_string(
@@ -799,14 +811,7 @@ mod tests {
         stub_empty(&server).await;
 
         let tmp = tempfile::tempdir()?;
-        let client = KcsClient::new(
-            &server.uri(),
-            "tok",
-            true,
-            None,
-            ApiVersion::V1,
-            Timeouts::default(),
-        )?;
+        let client = test_client(&server.uri(), ApiVersion::V1)?;
         let bundle = export_all(&client, tmp.path(), None).await?;
 
         let manifest: Value =
@@ -827,14 +832,7 @@ mod tests {
         stub_empty(&server).await;
 
         let tmp = tempfile::tempdir()?;
-        let client = KcsClient::new(
-            &server.uri(),
-            "tok",
-            true,
-            None,
-            ApiVersion::V1,
-            Timeouts::default(),
-        )?;
+        let client = test_client(&server.uri(), ApiVersion::V1)?;
         let bundle = export_all(&client, tmp.path(), None).await?;
 
         let file_name = bundle
@@ -862,14 +860,7 @@ mod tests {
         stub_empty(&server).await;
 
         let tmp = tempfile::tempdir()?;
-        let client = KcsClient::new(
-            &server.uri(),
-            "tok",
-            true,
-            None,
-            ApiVersion::V1,
-            Timeouts::default(),
-        )?;
+        let client = test_client(&server.uri(), ApiVersion::V1)?;
         let bundle = export_all(&client, tmp.path(), None).await?;
 
         let notif: Value = serde_json::from_str(&std::fs::read_to_string(
@@ -897,14 +888,7 @@ mod tests {
         stub_empty(&server).await;
 
         let tmp = tempfile::tempdir()?;
-        let client = KcsClient::new(
-            &server.uri(),
-            "tok",
-            true,
-            None,
-            ApiVersion::V1,
-            Timeouts::default(),
-        )?;
+        let client = test_client(&server.uri(), ApiVersion::V1)?;
         let bundle = export_all(&client, tmp.path(), None).await?;
 
         let bin = std::fs::read(bundle.join("policies/network-reputation.bin"))?;
@@ -942,14 +926,7 @@ mod tests {
         stub_empty(&server).await;
 
         let tmp = tempfile::tempdir()?;
-        let client = KcsClient::new(
-            &server.uri(),
-            "tok",
-            true,
-            None,
-            ApiVersion::V1,
-            Timeouts::default(),
-        )?;
+        let client = test_client(&server.uri(), ApiVersion::V1)?;
         let bundle = export_all(&client, tmp.path(), None).await?;
 
         let raw = std::fs::read_to_string(bundle.join("integrations/agent-groups.json"))?;
@@ -999,14 +976,7 @@ mod tests {
         stub_empty(&server).await;
 
         let tmp = tempfile::tempdir()?;
-        let client = KcsClient::new(
-            &server.uri(),
-            "tok",
-            true,
-            None,
-            ApiVersion::V1,
-            Timeouts::default(),
-        )?;
+        let client = test_client(&server.uri(), ApiVersion::V1)?;
         let bundle = export_all(&client, tmp.path(), None).await?;
 
         let data: Value = serde_json::from_str(&std::fs::read_to_string(
@@ -1042,14 +1012,7 @@ mod tests {
         stub_empty(&server).await;
 
         let tmp = tempfile::tempdir()?;
-        let client = KcsClient::new(
-            &server.uri(),
-            "tok",
-            true,
-            None,
-            ApiVersion::V1,
-            Timeouts::default(),
-        )?;
+        let client = test_client(&server.uri(), ApiVersion::V1)?;
         let bundle = export_all(&client, tmp.path(), None).await?;
 
         assert!(
@@ -1081,14 +1044,7 @@ mod tests {
         stub_empty(&server).await;
 
         let tmp = tempfile::tempdir()?;
-        let client = KcsClient::new(
-            &server.uri(),
-            "tok",
-            true,
-            None,
-            ApiVersion::V1,
-            Timeouts::default(),
-        )?;
+        let client = test_client(&server.uri(), ApiVersion::V1)?;
         let bundle = export_all(&client, tmp.path(), None).await?;
 
         let data: Value = serde_json::from_str(&std::fs::read_to_string(

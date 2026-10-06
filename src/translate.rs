@@ -205,6 +205,31 @@ impl Translator {
     ///
     /// [`TranslateError::Downgrade`] when `from` is `APIv3` and `to` is
     /// `APIv1`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use kcs_migrator::translate::Translator;
+    /// use kcs_migrator::version::{ApiVersion, KcsVersion};
+    ///
+    /// // A 2.4 bundle into a 2.5 target: the direction that translates.
+    /// let t = Translator::new(ApiVersion::V1, ApiVersion::V3, None, None)?;
+    /// assert!(!t.is_noop());
+    ///
+    /// // Same generation: the identity.
+    /// let same = Translator::new(ApiVersion::V3, ApiVersion::V3, None, None)?;
+    /// assert!(same.is_noop());
+    ///
+    /// // Downgrade is refused here, before any request is sent.
+    /// assert!(Translator::new(
+    ///     ApiVersion::V3,
+    ///     ApiVersion::V1,
+    ///     Some(KcsVersion::new(2, 5, 0)),
+    ///     Some(KcsVersion::new(2, 4, 1)),
+    /// )
+    /// .is_err());
+    /// # Ok::<(), kcs_migrator::translate::TranslateError>(())
+    /// ```
     pub fn new(
         from: ApiVersion,
         to: ApiVersion,
@@ -239,6 +264,24 @@ impl Translator {
     /// a no-op for every resource whose shape did not drift. Structural
     /// change — the runtime policy split — is
     /// [`Self::split_runtime_policy`], not this.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use kcs_migrator::translate::{Resource, Translator};
+    /// use kcs_migrator::version::ApiVersion;
+    /// use serde_json::json;
+    ///
+    /// let t = Translator::new(ApiVersion::V1, ApiVersion::V3, None, None)?;
+    /// let mut policy = json!({"name": "p", "failCICDStep": true});
+    ///
+    /// let changes = t.resource(Resource::AssurancePolicy, &mut policy);
+    ///
+    /// assert_eq!(policy["failExternalScansStep"], json!(true));
+    /// assert!(policy.get("failCICDStep").is_none());
+    /// assert_eq!(changes.renamed.len(), 1);
+    /// # Ok::<(), kcs_migrator::translate::TranslateError>(())
+    /// ```
     pub fn resource(&self, resource: Resource, body: &mut Value) -> Changes {
         if self.is_noop() {
             return Changes::default();

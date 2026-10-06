@@ -139,6 +139,18 @@ impl ApiVersion {
     ///
     /// The API generation to use against a given KCS release: `APIv1`
     /// below 2.5.0, `APIv3` from 2.5.0 on.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use kcs_migrator::version::{ApiVersion, KcsVersion};
+    ///
+    /// assert_eq!(ApiVersion::for_kcs(KcsVersion::new(2, 4, 9)), ApiVersion::V1);
+    /// assert_eq!(ApiVersion::for_kcs(KcsVersion::new(2, 5, 0)), ApiVersion::V3);
+    ///
+    /// // Numeric, not lexicographic: "2.10.0" sorts before "2.5.0" as text.
+    /// assert_eq!(ApiVersion::for_kcs(KcsVersion::new(2, 10, 0)), ApiVersion::V3);
+    /// ```
     #[must_use]
     pub fn for_kcs(version: KcsVersion) -> Self {
         if version < FIRST_V3_RELEASE {
@@ -163,6 +175,22 @@ impl ApiVersion {
 ///
 /// [`VersionError::Malformed`] when the component count is not three,
 /// [`VersionError::NotANumber`] when a component is not a decimal number.
+///
+/// # Examples
+///
+/// ```
+/// use kcs_migrator::version::{self, KcsVersion};
+///
+/// assert_eq!(version::parse("2.5.0")?, KcsVersion::new(2, 5, 0));
+///
+/// // Strict on purpose: a vendor endpoint emits one documented shape, so
+/// // anything else means the assumption broke and the operator should hear
+/// // about it rather than get a silently wrong API generation.
+/// assert!(version::parse("2.5").is_err());
+/// assert!(version::parse("v2.5.0").is_err());
+/// assert!(version::parse("2.5.0-rc1").is_err());
+/// # Ok::<(), version::VersionError>(())
+/// ```
 pub fn parse(s: &str) -> Result<KcsVersion, VersionError> {
     let mut parts = s.split('.');
     // `next()` three times plus an exhausted check, rather than `collect()` into a
@@ -202,6 +230,18 @@ pub fn parse(s: &str) -> Result<KcsVersion, VersionError> {
 ///
 /// [`VersionError::NoVersionField`] when `version` is absent or not a
 /// string; otherwise whatever [`parse`] returns.
+///
+/// # Examples
+///
+/// ```
+/// use kcs_migrator::version::{self, KcsVersion};
+/// use serde_json::json;
+///
+/// // The exact body a live KCS 2.5.0 instance returns.
+/// let body = json!({"version": "2.5.0"});
+/// assert_eq!(version::from_healthz_body(&body)?, KcsVersion::new(2, 5, 0));
+/// # Ok::<(), version::VersionError>(())
+/// ```
 pub fn from_healthz_body(body: &Value) -> Result<KcsVersion, VersionError> {
     let raw = body
         .get("version")

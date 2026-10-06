@@ -93,6 +93,56 @@ impl IdMapper {
                 source_id: source_id.to_string(),
             })
     }
+
+    /// # Overview
+    ///
+    /// Like [`Self::resolve`] but yields `None` instead of an error when
+    /// there is no mapping.
+    ///
+    /// For the call sites that degrade rather than abort: a security scope
+    /// that does not exist on the target is dropped with a warning, not
+    /// treated as a corrupt bundle. Built as its own method rather than
+    /// `resolve(..).ok()` because that form discards the error without
+    /// recording that it ever happened, and these call sites need to tell
+    /// the operator which lookup failed.
+    #[must_use]
+    pub fn resolve_opt(&self, resource_type: &str, source_id: &str) -> Option<&str> {
+        self.map
+            .get(resource_type)
+            .and_then(|type_map| type_map.get(source_id))
+            .map(String::as_str)
+    }
+
+    /// # Overview
+    ///
+    /// Records that `resource_type` was *considered*, without adding a
+    /// mapping.
+    ///
+    /// This exists because "no mappings" and "no mappings, and that is
+    /// meaningful" are different states. Security scopes are the case:
+    /// a bundle with no scope reference file must leave `systemScopes`
+    /// untouched, while a bundle that *has* one whose names matched
+    /// nothing on the target must drop those IDs — the target accepts a
+    /// stale ID and silently scopes the policy to nothing. Both states
+    /// have an empty map, so without this marker they are
+    /// indistinguishable and one of them is handled wrongly.
+    pub fn declare_type(&mut self, resource_type: &str) {
+        self.map.entry(resource_type.to_string()).or_default();
+    }
+
+    /// # Overview
+    ///
+    /// Whether `resource_type` has been declared or populated.
+    ///
+    /// True after either [`Self::register`] or [`Self::declare_type`].
+    /// Lets a caller distinguish "this resource class was never
+    /// considered" — so remapping should be skipped entirely — from
+    /// "considered, but this particular ID has no counterpart", which
+    /// means the reference is stale and must not be passed through.
+    #[must_use]
+    pub fn has_type(&self, resource_type: &str) -> bool {
+        self.map.contains_key(resource_type)
+    }
 }
 
 #[cfg(test)]
@@ -125,6 +175,47 @@ mod tests {
             m.resolve("runtime-profile", "bad-id"),
             Err(MapperError::UnknownId { .. })
         ));
+    }
+
+    #[test]
+    fn resolve_opt_yields_none_instead_of_an_error() {
+        let mut m = IdMapper::new();
+        m.register("scope", "src-1", "tgt-1");
+        assert_eq!(m.resolve_opt("scope", "src-1"), Some("tgt-1"));
+        // Unknown ID within a known type, and an entirely unknown type, are both
+        // None -- the caller that degrades gracefully does not care which.
+        assert_eq!(m.resolve_opt("scope", "absent"), None);
+        assert_eq!(m.resolve_opt("never-registered", "src-1"), None);
+    }
+
+    #[test]
+    fn has_type_separates_never_considered_from_missing_entry() {
+        let mut m = IdMapper::new();
+        assert!(!m.has_type("scope"));
+        m.register("scope", "src-1", "tgt-1");
+        assert!(m.has_type("scope"));
+        // Considered, but this ID is not in it: the reference is stale and must
+        // not be passed through, unlike the never-considered case.
+        assert!(m.resolve_opt("scope", "other").is_none());
+    }
+
+    #[test]
+    fn declare_type_marks_a_class_considered_without_adding_a_mapping() {
+        let mut m = IdMapper::new();
+        m.declare_type("scope");
+        assert!(
+            m.has_type("scope"),
+            "a bundle that listed its scopes was considered, even if none matched"
+        );
+        assert_eq!(m.resolve_opt("scope", "anything"), None);
+    }
+
+    #[test]
+    fn declare_type_does_not_clobber_existing_mappings() {
+        let mut m = IdMapper::new();
+        m.register("scope", "src-1", "tgt-1");
+        m.declare_type("scope");
+        assert_eq!(m.resolve_opt("scope", "src-1"), Some("tgt-1"));
     }
 
     #[test]

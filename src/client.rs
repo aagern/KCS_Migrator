@@ -66,6 +66,33 @@ impl Default for Timeouts {
     }
 }
 
+/// # Overview
+///
+/// The HTTP status behind an [`anyhow::Error`] produced by this module,
+/// or `None` if the failure was not an HTTP status error.
+///
+/// Every caller that needs to branch on a status — the graceful-skip
+/// paths in [`crate::importer`], the "feature not configured" paths in
+/// [`crate::export`] — goes through this rather than repeating the
+/// downcast. Repeating it is how one site ends up checking `400` while
+/// its neighbour checks `400 || 404` for the same condition.
+#[must_use]
+pub fn error_status(e: &anyhow::Error) -> Option<reqwest::StatusCode> {
+    e.downcast_ref::<reqwest::Error>()
+        .and_then(reqwest::Error::status)
+}
+
+/// # Overview
+///
+/// Whether an error is an HTTP 4xx.
+///
+/// Used where a 4xx means "this feature was never configured on the
+/// source" rather than a failure worth aborting for.
+#[must_use]
+pub fn is_client_error(e: &anyhow::Error) -> bool {
+    error_status(e).is_some_and(|s| s.is_client_error())
+}
+
 /// What a single `healthz` probe told us.
 ///
 /// Distinguishing these is what lets [`KcsClient::detect`] give a useful
@@ -826,6 +853,45 @@ mod tests {
         assert!(
             as_reqwest.is_timeout(),
             "expected a timeout, got: {as_reqwest}"
+        );
+        Ok(())
+    }
+
+    // ---- host header override ----
+
+    #[tokio::test]
+    async fn host_header_override_actually_reaches_the_server() -> Result<()> {
+        // The README documents --host-header for reaching KCS by ingress IP, and
+        // it is implemented by putting Host into reqwest's default_headers. Whether
+        // hyper overwrites that from the URL authority was never verified, so the
+        // feature was documented but unproven. This pins it.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/healthz"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"status": "ok"})))
+            .mount(&server)
+            .await;
+
+        let client = KcsClient::new(
+            &server.uri(),
+            "tok",
+            true,
+            Some("kcs.demo.lab"),
+            ApiVersion::V1,
+            Timeouts::default(),
+        )?;
+        client.get("/healthz").await?;
+
+        let seen = server.received_requests().await.unwrap_or_default();
+        let host = seen
+            .first()
+            .and_then(|r| r.headers.get("host"))
+            .map(|v| String::from_utf8_lossy(v.as_bytes()).to_string());
+        assert_eq!(
+            host.as_deref(),
+            Some("kcs.demo.lab"),
+            "the Host override must survive to the wire, not be replaced by the URL \
+             authority; got {host:?}"
         );
         Ok(())
     }

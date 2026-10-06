@@ -16,7 +16,7 @@
 //! POST-ready schema. List-only resources (reference dumps) can use
 //! `get_list` directly.
 
-use crate::client::KcsClient;
+use crate::client::{is_client_error, KcsClient};
 use anyhow::{anyhow, Result};
 use chrono::Utc;
 use serde_json::{json, Value};
@@ -73,13 +73,8 @@ async fn get_list(client: &KcsClient, api_path: &str) -> Result<Value> {
             }
         }
         Err(e) => {
-            if let Some(status) = e
-                .downcast_ref::<reqwest::Error>()
-                .and_then(reqwest::Error::status)
-            {
-                if status.as_u16() == 400 || status.as_u16() == 404 {
-                    return Ok(json!([]));
-                }
+            if is_client_error(&e) {
+                return Ok(json!([]));
             }
             Err(e)
         }
@@ -101,13 +96,8 @@ async fn get_single(client: &KcsClient, api_path: &str) -> Result<Value> {
         Ok(data) if data.is_object() => Ok(data),
         Ok(_) => Ok(json!({})),
         Err(e) => {
-            if let Some(status) = e
-                .downcast_ref::<reqwest::Error>()
-                .and_then(reqwest::Error::status)
-            {
-                if status.as_u16() == 400 || status.as_u16() == 404 {
-                    return Ok(json!({}));
-                }
+            if is_client_error(&e) {
+                return Ok(json!({}));
             }
             Err(e)
         }
@@ -165,17 +155,8 @@ async fn get_list_detailed(
         match client.get(&format!("{item_path_prefix}/{id}")).await {
             Ok(full) if full.is_object() => detailed.push(full),
             Ok(_) => detailed.push(item),
-            Err(e) => {
-                let is_4xx = e
-                    .downcast_ref::<reqwest::Error>()
-                    .and_then(reqwest::Error::status)
-                    .is_some_and(|s| s.is_client_error());
-                if is_4xx {
-                    detailed.push(item);
-                } else {
-                    return Err(e);
-                }
-            }
+            Err(e) if is_client_error(&e) => detailed.push(item),
+            Err(e) => return Err(e),
         }
     }
     Ok(Value::Array(detailed))
@@ -225,9 +206,46 @@ pub async fn export_all(client: &KcsClient, output_dir: &Path) -> Result<PathBuf
     export_network_reputation(client, &bundle).await?;
     export_components(client, &bundle).await?;
     export_config(client, &bundle).await?;
+    export_security_scopes(client, &bundle).await?;
+    // Written last, deliberately: the absence of `manifest.json` is what marks a
+    // bundle directory as incomplete, and the importer refuses such a directory
+    // before writing anything to the target.
     write_manifest(&bundle, &ts, client.base_url())?;
 
     Ok(bundle)
+}
+
+/// Fields a bundle must never carry, keyed by the resource they appear on.
+///
+/// `deploymentToken` is a live credential: it enrols a node-agent into the
+/// instance that issued it. The KCS API returns it in full from
+/// `GET /integrations/agent-group/<id>` — unlike `bindPassword` or
+/// `clientSecret`, which come back masked as `***` — so without this step
+/// every bundle on disk is a credential-bearing artifact.
+///
+/// Removing it costs nothing: [`crate::importer`] already discards the
+/// field before `POSTing`, because the target mints its own token. What is
+/// kept is the agent manifest data an import actually needs.
+const REDACT_FROM_AGENT_GROUP: &[&str] = &["deploymentToken"];
+
+/// Strips [`REDACT_FROM_AGENT_GROUP`] from every entry of an agent-group
+/// list, returning how many values were removed.
+fn redact_agent_groups(groups: &mut Value) -> usize {
+    let Some(items) = groups.as_array_mut() else {
+        return 0;
+    };
+    let mut removed = 0;
+    for group in items.iter_mut() {
+        let Some(obj) = group.as_object_mut() else {
+            continue;
+        };
+        for field in REDACT_FROM_AGENT_GROUP {
+            if obj.remove(*field).is_some() {
+                removed += 1;
+            }
+        }
+    }
+    removed
 }
 
 /// # Overview
@@ -265,12 +283,20 @@ async fn export_integrations(client: &KcsClient, bundle: &Path) -> Result<()> {
     let llm = get_single(client, "/integrations/llm").await?;
     write_json(&bundle.join("integrations/llm.json"), &llm)?;
 
-    let agent_groups = get_list_detailed(
+    let mut agent_groups = get_list_detailed(
         client,
         "/integrations/agent-group",
         "/integrations/agent-group",
     )
     .await?;
+    let redacted = redact_agent_groups(&mut agent_groups);
+    if redacted > 0 {
+        eprintln!(
+            "Note: removed {redacted} deployment token(s) from the agent-group export. \
+             They are server-issued credentials and cannot be replayed; the target mints \
+             its own when each agent group is created."
+        );
+    }
     write_json(
         &bundle.join("integrations/agent-groups.json"),
         &agent_groups,
@@ -317,33 +343,31 @@ async fn export_notifications_reference(client: &KcsClient, bundle: &Path) -> Re
 /// [`export_network_reputation`] because it is opaque bytes rather
 /// than JSON.
 ///
-/// All five collections use [`get_list`] (truncated list view). The
-/// known schema-drift caveat in the module-level docs applies: some
-/// fields required by POST are missing from the list projection and
-/// these will fail on import. Migrating these to [`get_list_detailed`]
-/// is the next mechanical fix (tracked in `CLAUDE.md`).
+/// All five use `get_list_detailed`. They used to use the truncated list
+/// view, which drops fields the import POST requires — a runtime
+/// profile's `fileOperationsRules`, for instance, is absent from the list
+/// projection, so the profile both failed to import and skipped the
+/// audit-event rename the `APIv1` bundle needs. Composing the list with
+/// per-item GETs is the fix.
 ///
 /// # Errors
 ///
 /// Returns the first transport, parse, or filesystem error.
 async fn export_policies(client: &KcsClient, bundle: &Path) -> Result<()> {
-    let scanner = get_list(client, "/policies/scanner").await?;
-    write_json(&bundle.join("policies/scanner.json"), &scanner)?;
-
-    let assurance = get_list(client, "/policies/assurance").await?;
-    write_json(&bundle.join("policies/assurance.json"), &assurance)?;
-
-    let runtime_profiles = get_list(client, "/policies/runtime-profile").await?;
-    write_json(
-        &bundle.join("policies/runtime-profiles.json"),
-        &runtime_profiles,
-    )?;
-
-    let runtime = get_list(client, "/policies/runtime").await?;
-    write_json(&bundle.join("policies/runtime.json"), &runtime)?;
-
-    let response = get_list(client, "/policies/response").await?;
-    write_json(&bundle.join("policies/response.json"), &response)?;
+    // (list endpoint, per-item endpoint, bundle file)
+    for (path, file) in [
+        ("/policies/scanner", "policies/scanner.json"),
+        ("/policies/assurance", "policies/assurance.json"),
+        (
+            "/policies/runtime-profile",
+            "policies/runtime-profiles.json",
+        ),
+        ("/policies/runtime", "policies/runtime.json"),
+        ("/policies/response", "policies/response.json"),
+    ] {
+        let detailed = get_list_detailed(client, path, path).await?;
+        write_json(&bundle.join(file), &detailed)?;
+    }
 
     Ok(())
 }
@@ -357,15 +381,27 @@ async fn export_policies(client: &KcsClient, bundle: &Path) -> Result<()> {
 /// The blob is opaque to the migrator — it's replayed verbatim during
 /// import via [`crate::client::KcsClient::put_bytes`].
 ///
+/// A 4xx is treated as "the feature was never configured" and no file is
+/// written, which is how every other section already behaves. Before this,
+/// a source instance with no custom reputation list aborted the whole
+/// export at the last step — after every other file had been written but
+/// before `manifest.json`, leaving a bundle that looked merely incomplete.
+///
 /// # Errors
 ///
-/// Returns a transport error from the GET, or a filesystem error if
-/// the parent directory cannot be created or the file cannot be
+/// Returns a non-4xx transport error from the GET, or a filesystem error
+/// if the parent directory cannot be created or the file cannot be
 /// written.
 async fn export_network_reputation(client: &KcsClient, bundle: &Path) -> Result<()> {
-    let bytes = client
-        .get_bytes("/policies/custom-reputation/export")
-        .await?;
+    let bytes = match client.get_bytes("/policies/custom-reputation/export").await {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            if is_client_error(&e) {
+                return Ok(());
+            }
+            return Err(e);
+        }
+    };
     let path = bundle.join("policies/network-reputation.bin");
     let parent = path
         .parent()
@@ -409,6 +445,31 @@ async fn export_config(client: &KcsClient, bundle: &Path) -> Result<()> {
         &bundle.join("config/reports-storage.json"),
         &reports_storage,
     )?;
+    Ok(())
+}
+
+/// # Overview
+///
+/// Dumps the `security/` section — the instance's security scopes, as
+/// `scopes-REFERENCE.json`.
+///
+/// Reference-only: `/security/scopes` is **GET-only**, so scopes cannot be
+/// created through the API and the operator has to recreate them by hand
+/// on the target. The file is still essential rather than informational,
+/// because four resource classes reference scopes by ID
+/// (`systemScopes`): assurance policies, runtime policies and profiles,
+/// and — from 2.5 — admission-controller policies, benchmark frameworks
+/// and external groups. The importer reads this file to learn each source
+/// scope's *name*, looks that name up on the target, and rewrites the IDs.
+/// Without it those references would point at the source instance's ID
+/// space and silently scope every policy to nothing.
+///
+/// # Errors
+///
+/// Returns the first transport, parse, or filesystem error.
+async fn export_security_scopes(client: &KcsClient, bundle: &Path) -> Result<()> {
+    let scopes = get_list(client, "/security/scopes").await?;
+    write_json(&bundle.join("security/scopes-REFERENCE.json"), &scopes)?;
     Ok(())
 }
 
@@ -467,6 +528,12 @@ mod tests {
                 .mount(server)
                 .await;
         }
+        // Detail endpoints for the per-item sweep, and the scopes list.
+        Mock::given(method("GET"))
+            .and(path("/v1/security/scopes"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .mount(server)
+            .await;
         for p in ["/v1/scanners/priority", "/v1/reports/storage/config"] {
             Mock::given(method("GET"))
                 .and(path(p))
@@ -632,6 +699,195 @@ mod tests {
 
         let bin = std::fs::read(bundle.join("policies/network-reputation.bin"))?;
         assert_eq!(bin, b"binary-data");
+        Ok(())
+    }
+
+    // ---- group 6: deployment tokens must not reach the bundle ----
+
+    #[tokio::test]
+    async fn agent_group_export_strips_the_deployment_token() -> Result<()> {
+        // GET /integrations/agent-group/<id> returns deploymentToken in full --
+        // unlike bindPassword or clientSecret, which come back masked as ***. It is
+        // a live credential that enrols a node-agent into the issuing instance, so
+        // without this step every bundle on disk is credential-bearing.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/integrations/agent-group"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "items": [{"id": "g1", "groupName": "k8s"}]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/integrations/agent-group/g1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "g1",
+                "groupName": "k8s",
+                "deploymentToken": "SECRET-DEPLOY-TOKEN",
+                "kcsNamespace": "kcs",
+                "networkEnabled": true,
+            })))
+            .mount(&server)
+            .await;
+        stub_empty(&server).await;
+
+        let tmp = tempfile::tempdir()?;
+        let client = KcsClient::new(
+            &server.uri(),
+            "tok",
+            true,
+            None,
+            ApiVersion::V1,
+            Timeouts::default(),
+        )?;
+        let bundle = export_all(&client, tmp.path()).await?;
+
+        let raw = std::fs::read_to_string(bundle.join("integrations/agent-groups.json"))?;
+        assert!(
+            !raw.contains("SECRET-DEPLOY-TOKEN"),
+            "the deployment token must not be written to disk"
+        );
+        let data: Value = serde_json::from_str(&raw)?;
+        assert!(data[0].get("deploymentToken").is_none());
+        // The manifest data an import actually needs is kept.
+        assert_eq!(data[0]["groupName"], "k8s");
+        assert_eq!(data[0]["kcsNamespace"], "kcs");
+        assert_eq!(data[0]["networkEnabled"], json!(true));
+        Ok(())
+    }
+
+    // ---- group 6: policies are exported POST-ready ----
+
+    #[tokio::test]
+    async fn policy_export_composes_per_item_detail_not_the_list_projection() -> Result<()> {
+        // The list projection drops fields POST requires. A runtime profile's
+        // fileOperationsRules is the clearest case: absent from the list, so the
+        // profile both failed to import and skipped the APIv3 audit-event rename
+        // that depends on walking those rules.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/policies/runtime-profile"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "items": [{"id": "p1", "name": "busybox"}]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/policies/runtime-profile/p1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "p1",
+                "name": "busybox",
+                "fileOperationsRules": {"items": [{"paths": ["/etc"]}]},
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/integrations/image-registries"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"items": []})))
+            .mount(&server)
+            .await;
+        stub_empty(&server).await;
+
+        let tmp = tempfile::tempdir()?;
+        let client = KcsClient::new(
+            &server.uri(),
+            "tok",
+            true,
+            None,
+            ApiVersion::V1,
+            Timeouts::default(),
+        )?;
+        let bundle = export_all(&client, tmp.path()).await?;
+
+        let data: Value = serde_json::from_str(&std::fs::read_to_string(
+            bundle.join("policies/runtime-profiles.json"),
+        )?)?;
+        assert_eq!(
+            data[0]["fileOperationsRules"]["items"][0]["paths"][0],
+            json!("/etc"),
+            "the detail-only field must be in the bundle"
+        );
+        Ok(())
+    }
+
+    // ---- group 6: an unconfigured feature must not abort the export ----
+
+    #[tokio::test]
+    async fn a_404_on_the_reputation_export_leaves_the_rest_of_the_bundle_intact() -> Result<()> {
+        // This was the one section that aborted on 4xx. It runs near the end, so a
+        // source with no custom reputation list produced a bundle with every other
+        // file written but no manifest.json -- indistinguishable from an export
+        // that was interrupted.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/integrations/image-registries"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"items": []})))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/policies/custom-reputation/export"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        stub_empty(&server).await;
+
+        let tmp = tempfile::tempdir()?;
+        let client = KcsClient::new(
+            &server.uri(),
+            "tok",
+            true,
+            None,
+            ApiVersion::V1,
+            Timeouts::default(),
+        )?;
+        let bundle = export_all(&client, tmp.path()).await?;
+
+        assert!(
+            !bundle.join("policies/network-reputation.bin").exists(),
+            "an unconfigured feature writes no file"
+        );
+        assert!(
+            bundle.join("manifest.json").exists(),
+            "the export must still complete -- the manifest is what marks it complete"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn security_scopes_are_exported_for_reference() -> Result<()> {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/integrations/image-registries"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"items": []})))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/security/scopes"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                {"id": "s1", "name": "Default scope"}
+            ])))
+            .mount(&server)
+            .await;
+        stub_empty(&server).await;
+
+        let tmp = tempfile::tempdir()?;
+        let client = KcsClient::new(
+            &server.uri(),
+            "tok",
+            true,
+            None,
+            ApiVersion::V1,
+            Timeouts::default(),
+        )?;
+        let bundle = export_all(&client, tmp.path()).await?;
+
+        let data: Value = serde_json::from_str(&std::fs::read_to_string(
+            bundle.join("security/scopes-REFERENCE.json"),
+        )?)?;
+        // Reference-only -- /security/scopes is GET-only -- but the importer needs
+        // the id-to-name pairing to remap systemScopes onto the target.
+        assert_eq!(data[0]["name"], "Default scope");
+        assert_eq!(data[0]["id"], "s1");
         Ok(())
     }
 }

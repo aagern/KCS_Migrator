@@ -80,7 +80,9 @@
 //!     "https://kcs.tgt.corp", "tok", true, None, Timeouts::default(),
 //! ).await?;
 //! println!("migrating KCS {src_kcs} → KCS {tgt_kcs}");
-//! let mapper = importer::import_bundle(&target, &bundle).await?;
+//! let mapper = importer::import_bundle(
+//!     &target, &bundle, &importer::ImportOptions::default(),
+//! ).await?;
 //! # Ok(())
 //! # }
 //! ```

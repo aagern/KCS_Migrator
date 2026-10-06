@@ -14,6 +14,7 @@ use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
 
 use kcs_migrator::cli::ConnOpts;
+use kcs_migrator::importer::ImportOptions;
 use kcs_migrator::{export, importer, users};
 
 #[derive(Parser)]
@@ -70,6 +71,15 @@ enum Commands {
         /// Resolve and describe every call without sending a single write.
         #[arg(long)]
         dry_run: bool,
+
+        /// Abort instead of continuing when a response policy references a
+        /// notification channel that cannot be recreated on the target.
+        ///
+        /// Notification channels have no create endpoint in the KCS API, so by
+        /// default such a policy is imported without them and the operator is
+        /// warned that it will notify nobody until they are reattached by hand.
+        #[arg(long)]
+        strict_notifications: bool,
     },
 }
 
@@ -104,6 +114,7 @@ async fn main() -> Result<()> {
             bundle,
             conn,
             dry_run,
+            strict_notifications,
         } => {
             let (client, resolved) = conn.connect().await?;
             let client = client.with_dry_run(dry_run);
@@ -112,7 +123,10 @@ async fn main() -> Result<()> {
                 println!("DRY RUN: no write will be sent to the target.");
             }
 
-            importer::import_bundle(&client, &bundle).await?;
+            let options = ImportOptions {
+                strict_notifications,
+            };
+            importer::import_bundle(&client, &bundle, &options).await?;
 
             if dry_run {
                 println!("Dry run complete. Nothing was written.");

@@ -80,7 +80,7 @@ fn read_json(path: &Path) -> Result<Value> {
 /// [`import_agent_groups`].
 fn http_status(e: &anyhow::Error) -> Option<u16> {
     e.downcast_ref::<reqwest::Error>()
-        .and_then(|re| re.status())
+        .and_then(reqwest::Error::status)
         .map(|s| s.as_u16())
 }
 
@@ -123,7 +123,7 @@ async fn enable_policy(client: &KcsClient, endpoint: &str, tgt_id: &str) -> Resu
 /// (the source instance never configured it).
 async fn import_reports_storage(client: &KcsClient, bundle: &Path) -> Result<()> {
     let cfg = read_json(&bundle.join("config/reports-storage.json"))?;
-    if cfg.as_object().map(|o| !o.is_empty()).unwrap_or(false) {
+    if cfg.as_object().is_some_and(|o| !o.is_empty()) {
         client.put_json("/v1/reports/storage/config", &cfg).await?;
     }
     Ok(())
@@ -137,8 +137,7 @@ async fn import_scanner_priority(client: &KcsClient, bundle: &Path) -> Result<()
     let has_controls = priority
         .get("controls")
         .and_then(|c| c.as_array())
-        .map(|a| !a.is_empty())
-        .unwrap_or(false);
+        .is_some_and(|a| !a.is_empty());
     if has_controls {
         client.post("/v1/scanners/priority", &priority).await?;
     }
@@ -150,14 +149,15 @@ async fn import_scanner_priority(client: &KcsClient, bundle: &Path) -> Result<()
 /// single object; both shapes are accepted. No-op if empty.
 async fn import_ldap(client: &KcsClient, bundle: &Path) -> Result<()> {
     let raw = read_json(&bundle.join("integrations/ldap.json"))?;
-    let data = match raw.as_array() {
-        Some(arr) => arr
-            .first()
-            .cloned()
-            .unwrap_or(Value::Object(Default::default())),
-        None => raw,
-    };
-    if data.as_object().map(|o| !o.is_empty()).unwrap_or(false) {
+    let data = raw.as_array().map_or_else(
+        || raw.clone(),
+        |arr| {
+            arr.first()
+                .cloned()
+                .unwrap_or_else(|| Value::Object(serde_json::Map::default()))
+        },
+    );
+    if data.as_object().is_some_and(|o| !o.is_empty()) {
         client
             .put_json("/v1/integrations/ldap", &strip(&data))
             .await?;
@@ -413,20 +413,50 @@ fn rewrite_runtime_profile_match_blocks(
 
     let mut rewritten = Vec::with_capacity(blocks.len());
     for mut block in blocks {
-        if let Some(old_id) = block.get("runtimeProfileId").and_then(|v| v.as_str()) {
-            let new_id = mapper.resolve("runtime-profile", old_id).map_err(|_| {
+        // `resolve` hands back a `&str` borrowed from `mapper`; `to_string()` ends that
+        // borrow before `block` is written, which is also what lets the loop keep using
+        // `mapper` on the next iteration.
+        let resolved = match block.get("runtimeProfileId").and_then(Value::as_str) {
+            Some(old_id) => Some(
+                mapper
+                    .resolve("runtime-profile", old_id)
+                    .map_err(|_| {
+                        anyhow!(
+                            "Runtime policy '{}' references runtime profile ID '{}' \
+                             that was not registered during import.",
+                            name_or_id(original, "name", src_id),
+                            old_id
+                        )
+                    })?
+                    .to_string(),
+            ),
+            None => None,
+        };
+        if let Some(new_id) = resolved {
+            // `as_object_mut` instead of `block["runtimeProfileId"] = …`: `IndexMut` on
+            // `Value` panics when the target is not an object, so the fallible case is
+            // handled here rather than left to a runtime abort.
+            let obj = block.as_object_mut().ok_or_else(|| {
                 anyhow!(
-                    "Runtime policy '{}' references runtime profile ID '{}' \
-                     that was not registered during import.",
-                    name_or_id(original, "name", src_id),
-                    old_id
+                    "Runtime policy '{}' has a runtimeProfileMatchBlocks entry that is \
+                     not a JSON object.",
+                    name_or_id(original, "name", src_id)
                 )
             })?;
-            block["runtimeProfileId"] = Value::String(new_id.to_string());
+            obj.insert("runtimeProfileId".to_string(), Value::String(new_id));
         }
         rewritten.push(block);
     }
-    body["runtimeProfileMatchBlocks"] = Value::Array(rewritten);
+    let obj = body.as_object_mut().ok_or_else(|| {
+        anyhow!(
+            "Runtime policy '{}' body is not a JSON object.",
+            name_or_id(original, "name", src_id)
+        )
+    })?;
+    obj.insert(
+        "runtimeProfileMatchBlocks".to_string(),
+        Value::Array(rewritten),
+    );
     Ok(())
 }
 
@@ -439,7 +469,15 @@ fn rewrite_runtime_profile_match_blocks(
 /// KCS API has no create endpoint for them.
 fn warn_notifications_reference(bundle: &Path) -> Result<()> {
     let notif_ref = read_json(&bundle.join("integrations/notifications-REFERENCE.json"))?;
-    let count = |key: &str| notif_ref[key].as_array().map(|a| a.len()).unwrap_or(0);
+    // `.get(key)` rather than `notif_ref[key]`: indexing a `Value` yields `Null` for a
+    // missing key instead of panicking, but the same habit over a `Vec` does panic, so the
+    // crate denies `clippy::indexing_slicing` everywhere and uses checked access instead.
+    let count = |key: &str| {
+        notif_ref
+            .get(key)
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len)
+    };
     let email = count("email");
     let telegram = count("telegram");
     let webhook = count("webhook");
@@ -513,24 +551,24 @@ fn rewrite_notification_settings_ids(
         return Ok(());
     };
 
-    let mut mapped = Vec::with_capacity(notif_ids.len());
-    let mut unmapped = Vec::new();
+    let mut resolved = Vec::with_capacity(notif_ids.len());
+    let mut missing = Vec::new();
     for id_val in &notif_ids {
         if let Some(id) = id_val.as_str() {
             match mapper.resolve("notification", id) {
-                Ok(new_id) => mapped.push(Value::String(new_id.to_string())),
-                Err(_) => unmapped.push(id.to_string()),
+                Ok(new_id) => resolved.push(Value::String(new_id.to_string())),
+                Err(_) => missing.push(id.to_string()),
             }
         }
     }
-    if !unmapped.is_empty() {
+    if !missing.is_empty() {
         return Err(anyhow!(
             "Cannot import response policy '{}': notification channel IDs are not mapped — {:?}",
             name_or_id(original, "name", src_id),
-            unmapped
+            missing
         ));
     }
-    body["notificationSettingsIds"] = Value::Array(mapped);
+    body["notificationSettingsIds"] = Value::Array(resolved);
     Ok(())
 }
 

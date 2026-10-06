@@ -161,7 +161,7 @@ impl KcsClient {
             .error_for_status()?;
         let bytes = resp.bytes().await?;
         if bytes.is_empty() {
-            Ok(serde_json::Value::Object(Default::default()))
+            Ok(serde_json::Value::Object(serde_json::Map::default()))
         } else {
             Ok(serde_json::from_slice(&bytes)?)
         }
@@ -172,6 +172,7 @@ impl KcsClient {
     /// Returns the base URL the client was constructed with, with any
     /// trailing slash stripped. Used by [`crate::export::export_all`]
     /// to record the source URL in the bundle manifest.
+    #[must_use]
     pub fn base_url(&self) -> &str {
         &self.base
     }

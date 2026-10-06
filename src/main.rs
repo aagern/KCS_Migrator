@@ -1,3 +1,14 @@
+#![forbid(unsafe_code)]
+#![warn(clippy::pedantic, clippy::nursery)]
+#![deny(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::todo,
+    clippy::unimplemented
+)]
+
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;

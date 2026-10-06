@@ -1,3 +1,8 @@
+/target
 binary
 .DS_Store
-Cargo.lock
+
+# Local tooling — see scripts/CLAUDE.md
+.claude/
+openspec/
+.code-review-graph/

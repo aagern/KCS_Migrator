@@ -19,7 +19,7 @@ use thiserror::Error;
 /// no entry to substitute. Both variants are reported up as
 /// [`anyhow::Error`] by the importer with additional context (the
 /// owning policy's name and the missing ID).
-#[derive(Error, Debug, PartialEq)]
+#[derive(Error, Debug, PartialEq, Eq)]
 pub enum MapperError {
     /// The resource type has no entries registered yet — usually means
     /// the dependency-order step that creates this kind of resource
@@ -51,6 +51,7 @@ impl IdMapper {
     ///
     /// Constructs an empty mapper. Equivalent to
     /// [`IdMapper::default`].
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -86,7 +87,7 @@ impl IdMapper {
             .ok_or_else(|| MapperError::UnknownType(resource_type.to_string()))?;
         type_map
             .get(source_id)
-            .map(|s| s.as_str())
+            .map(String::as_str)
             .ok_or_else(|| MapperError::UnknownId {
                 resource_type: resource_type.to_string(),
                 source_id: source_id.to_string(),

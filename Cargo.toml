@@ -1,7 +1,8 @@
 [package]
 name = "kcs_migrator"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
+rust-version = "1.98.1"
 
 [lib]
 name = "kcs_migrator"
@@ -19,7 +20,9 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
-tokio = { version = "1", features = ["full"] }
+# Narrowed from `full`: this is an HTTP client, not a server. `rt-multi-thread` + `macros`
+# back `#[tokio::main]`; `time` backs the request timeouts and the paused-clock tests.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 
 [dev-dependencies]
 tempfile = "3"

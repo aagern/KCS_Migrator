@@ -11,10 +11,10 @@
 //! each item — often missing fields the `POST` endpoint requires
 //! (e.g. `scanTimeout` on image registries, `agentType` on agent
 //! groups). For resource classes that get re-`POST`ed during import,
-//! [`get_list_detailed`] composes the list response with per-item
+//! `get_list_detailed` composes the list response with per-item
 //! `GET /v1/<resource>/<id>` calls so the bundle records the full
 //! POST-ready schema. List-only resources (reference dumps) can use
-//! [`get_list`] directly.
+//! `get_list` directly.
 
 use crate::client::KcsClient;
 use anyhow::{anyhow, Result};
@@ -75,7 +75,7 @@ async fn get_list(client: &KcsClient, api_path: &str) -> Result<Value> {
         Err(e) => {
             if let Some(status) = e
                 .downcast_ref::<reqwest::Error>()
-                .and_then(|re| re.status())
+                .and_then(reqwest::Error::status)
             {
                 if status.as_u16() == 400 || status.as_u16() == 404 {
                     return Ok(json!([]));
@@ -103,7 +103,7 @@ async fn get_single(client: &KcsClient, api_path: &str) -> Result<Value> {
         Err(e) => {
             if let Some(status) = e
                 .downcast_ref::<reqwest::Error>()
-                .and_then(|re| re.status())
+                .and_then(reqwest::Error::status)
             {
                 if status.as_u16() == 400 || status.as_u16() == 404 {
                     return Ok(json!({}));
@@ -168,9 +168,8 @@ async fn get_list_detailed(
             Err(e) => {
                 let is_4xx = e
                     .downcast_ref::<reqwest::Error>()
-                    .and_then(|re| re.status())
-                    .map(|s| s.is_client_error())
-                    .unwrap_or(false);
+                    .and_then(reqwest::Error::status)
+                    .is_some_and(|s| s.is_client_error());
                 if is_4xx {
                     detailed.push(item);
                 } else {

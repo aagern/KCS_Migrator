@@ -25,11 +25,11 @@ const SQL: &str = "SELECT username, COALESCE(email,''), COALESCE(display_name,''
 /// # Overview
 ///
 /// Runs `kubectl exec` into the KCS PostgreSQL pod in `namespace`,
-/// dumps the `users` table via [`SQL`], parses the pipe-separated
+/// dumps the `users` table via the `SQL` query below, parses the pipe-separated
 /// rows, and writes the result to `output_dir/users-REFERENCE.json`.
 /// Returns the parsed user records as well.
 ///
-/// `pod_selector` is the StatefulSet name to target (e.g.
+/// `pod_selector` is the `StatefulSet` name to target (e.g.
 /// `"kcs-postgresql"` in a default deployment).
 ///
 /// # Errors
@@ -81,17 +81,22 @@ pub fn export_users_reference(
             continue;
         }
         let parts: Vec<&str> = line.splitn(7, '|').collect();
-        if parts.len() != 7 {
+        // Slice pattern instead of `parts.len() != 7` plus seven index expressions: the
+        // match binds all seven fields or fails, so the compiler — not a hand-written
+        // length check — is what guarantees every binding exists.
+        let [username, email, display_name, roles, user_type, identity_provider, active] =
+            parts.as_slice()
+        else {
             continue;
-        }
+        };
         users.push(json!({
-            "username": parts[0],
-            "email": parts[1],
-            "display_name": parts[2],
-            "roles": parts[3],
-            "user_type": parts[4],
-            "identity_provider": parts[5],
-            "active": parts[6] == "true",
+            "username": username,
+            "email": email,
+            "display_name": display_name,
+            "roles": roles,
+            "user_type": user_type,
+            "identity_provider": identity_provider,
+            "active": *active == "true",
         }));
     }
 
@@ -142,17 +147,16 @@ mod tests {
     #[test]
     fn empty_psql_output_returns_empty_vec() {
         let raw = "\n\n";
-        let users: Vec<Value> = raw
+        let mut users = raw
             .lines()
             .filter(|l| !l.trim().is_empty())
             .filter_map(|line| {
                 let parts: Vec<&str> = line.splitn(7, '|').collect();
-                if parts.len() != 7 {
+                let [username, ..] = parts.as_slice() else {
                     return None;
-                }
-                Some(json!({"username": parts[0]}))
-            })
-            .collect();
-        assert!(users.is_empty());
+                };
+                Some(json!({ "username": username }))
+            });
+        assert!(users.next().is_none());
     }
 }

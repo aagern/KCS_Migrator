@@ -1,3 +1,23 @@
+#![forbid(unsafe_code)]
+#![warn(clippy::pedantic, clippy::nursery)]
+#![deny(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::todo,
+    clippy::unimplemented
+)]
+#![cfg_attr(
+    test,
+    allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)
+)]
+// pedantic; `version::KcsVersion` and `client::KcsClient` read better than `version::Kcs`:
+#![allow(clippy::module_name_repetitions)]
+// pedantic; every public fn here already carries a hand-written `# Errors` section, and the
+// lint also fires on private helpers where that docblock would be noise:
+#![allow(clippy::missing_errors_doc)]
+
 //! # Overview
 //!
 //! `kcs_migrator` is a two-phase migration toolkit for the KCS

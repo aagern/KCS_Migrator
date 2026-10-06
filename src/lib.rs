@@ -44,6 +44,7 @@
 //!
 //! | Module | Responsibility |
 //! |---|---|
+//! | [`cli`]       | Connection options shared by the subcommands, and how they become a client. |
 //! | [`client`]    | Async [`reqwest`] wrapper that injects the `Tron-Token` auth header. |
 //! | [`export`]    | Dumps a source KCS to a versioned bundle directory. |
 //! | [`importer`]  | Replays a bundle onto a target KCS in dependency order. |
@@ -83,6 +84,7 @@
 //! # }
 //! ```
 
+pub mod cli;
 pub mod client;
 pub mod export;
 pub mod id_mapper;

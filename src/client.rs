@@ -30,6 +30,8 @@
 //! by KCS. They are cancel-safe but **not idempotent**, so a cancelled
 //! import must not be retried by re-running it against the same target.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
@@ -95,6 +97,14 @@ pub struct KcsClient {
     base: String,
     api: ApiVersion,
     http: reqwest::Client,
+    /// When set, writes are described on stdout and never sent.
+    dry_run: bool,
+    /// Supplies the synthetic IDs a dry run hands back in place of the
+    /// server's. `Arc<AtomicU64>` rather than a plain counter because
+    /// `KcsClient` is shared behind `&self` and cloned to share the
+    /// connection pool, so the sequence has to be shared too -- a
+    /// per-clone counter would mint colliding IDs.
+    dry_run_seq: Arc<AtomicU64>,
 }
 
 /// Builds the underlying HTTP client: auth header, optional `Host`
@@ -171,6 +181,7 @@ impl std::fmt::Debug for KcsClient {
             .field("base", &self.base)
             .field("api", &self.api)
             .field("token", &"<redacted>")
+            .field("dry_run", &self.dry_run)
             .finish_non_exhaustive()
     }
 }
@@ -206,6 +217,8 @@ impl KcsClient {
             base: base_url.trim_end_matches('/').to_string(),
             api,
             http,
+            dry_run: false,
+            dry_run_seq: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -246,7 +259,16 @@ impl KcsClient {
             match probe_healthz(&http, &base, prefix).await {
                 Probe::Version(found) => {
                     let api = ApiVersion::for_kcs(found);
-                    return Ok((Self { base, api, http }, found));
+                    return Ok((
+                        Self {
+                            base,
+                            api,
+                            http,
+                            dry_run: false,
+                            dry_run_seq: Arc::new(AtomicU64::new(0)),
+                        },
+                        found,
+                    ));
                 }
                 // This generation is not served here; fall out of the match and let
                 // the loop try the next prefix. (An explicit `continue` here is what
@@ -272,6 +294,46 @@ impl KcsClient {
         }
 
         Err(VersionError::Undetectable.into())
+    }
+
+    /// # Overview
+    ///
+    /// Returns this client with writes disabled.
+    ///
+    /// In dry-run mode [`Self::post`], [`Self::put_json`] and
+    /// [`Self::put_bytes`] describe what they would send on stdout and
+    /// return a synthetic response instead of sending anything. Reads
+    /// still go to the server, so the whole pipeline — including
+    /// foreign-key rewriting, which needs a created resource's ID — runs
+    /// end to end against real data.
+    ///
+    /// A builder method rather than another [`Self::new`] parameter: that
+    /// signature already takes six arguments, and dry-run is orthogonal
+    /// to how the connection is made.
+    #[must_use]
+    pub const fn with_dry_run(mut self, dry_run: bool) -> Self {
+        self.dry_run = dry_run;
+        self
+    }
+
+    /// # Overview
+    ///
+    /// Whether writes are suppressed.
+    #[must_use]
+    pub const fn is_dry_run(&self) -> bool {
+        self.dry_run
+    }
+
+    /// Reports a suppressed write and mints the synthetic ID that stands in
+    /// for the one the server would have assigned.
+    fn describe_suppressed_write(&self, verb: &str, path: &str, body_len: usize) -> String {
+        let seq = self.dry_run_seq.fetch_add(1, Ordering::Relaxed);
+        let id = format!("dry-run-{seq:04}");
+        println!(
+            "DRY RUN  {verb:4} {}  ({body_len} bytes)  -> id {id}",
+            self.url(path)
+        );
+        id
     }
 
     /// # Overview
@@ -360,6 +422,11 @@ impl KcsClient {
     /// [`reqwest::Error`]) to distinguish 400-graceful-skip from a hard
     /// failure.
     pub async fn post(&self, path: &str, body: &serde_json::Value) -> Result<serde_json::Value> {
+        if self.dry_run {
+            let len = serde_json::to_vec(body).map_or(0, |v| v.len());
+            let id = self.describe_suppressed_write("POST", path, len);
+            return Ok(serde_json::json!({ "id": id }));
+        }
         let resp = self
             .http
             .post(self.url(path))
@@ -393,6 +460,11 @@ impl KcsClient {
         path: &str,
         body: &serde_json::Value,
     ) -> Result<serde_json::Value> {
+        if self.dry_run {
+            let len = serde_json::to_vec(body).map_or(0, |v| v.len());
+            self.describe_suppressed_write("PUT", path, len);
+            return Ok(serde_json::Value::Object(serde_json::Map::default()));
+        }
         let resp = self
             .http
             .put(self.url(path))
@@ -436,6 +508,10 @@ impl KcsClient {
     /// Returns the transport error, or an HTTP status error for any
     /// non-2xx response.
     pub async fn put_bytes(&self, path: &str, data: Vec<u8>) -> Result<()> {
+        if self.dry_run {
+            self.describe_suppressed_write("PUT", path, data.len());
+            return Ok(());
+        }
         self.http
             .put(self.url(path))
             .header(CONTENT_TYPE, "application/octet-stream")
@@ -750,6 +826,107 @@ mod tests {
         assert!(
             as_reqwest.is_timeout(),
             "expected a timeout, got: {as_reqwest}"
+        );
+        Ok(())
+    }
+
+    // ---- §7.6 dry run ----
+
+    #[tokio::test]
+    async fn dry_run_suppresses_writes_but_still_reads() -> Result<()> {
+        let server = MockServer::start().await;
+        // Reads succeed. Writes are mounted to fail loudly: if dry-run let one
+        // through, the 500 would surface as an error instead of a silent pass.
+        Mock::given(method("GET"))
+            .and(path("/v1/policies/scanner"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"items": []})))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let client = v1_client(&server.uri(), "tok")?.with_dry_run(true);
+        assert!(client.is_dry_run());
+
+        client.get("/policies/scanner").await?;
+        client
+            .post("/policies/scanner", &json!({"name": "p"}))
+            .await?;
+        client
+            .put_json("/integrations/ldap", &json!({"n": 1}))
+            .await?;
+        client
+            .put_bytes("/policies/custom-reputation/import", b"blob".to_vec())
+            .await?;
+
+        let seen = server.received_requests().await.unwrap_or_default();
+        let non_get: Vec<_> = seen
+            .iter()
+            .filter(|r| r.method != wiremock::http::Method::GET)
+            .map(|r| format!("{} {}", r.method, r.url.path()))
+            .collect();
+        assert!(
+            non_get.is_empty(),
+            "dry run must send no writes, sent: {non_get:?}"
+        );
+        assert_eq!(seen.len(), 1, "the read should still have gone out");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dry_run_mints_distinct_ids_so_fk_rewriting_still_works() -> Result<()> {
+        // The importer registers a created resource's id and rewrites later
+        // references to it. A dry run that returned the same id twice, or none,
+        // would collapse those mappings and hide real FK bugs.
+        let server = MockServer::start().await;
+        let client = v1_client(&server.uri(), "tok")?.with_dry_run(true);
+
+        let first = client.post("/policies/runtime-profile", &json!({})).await?;
+        let second = client.post("/policies/runtime-profile", &json!({})).await?;
+
+        let id_of = |v: &Value| v["id"].as_str().unwrap_or_default().to_string();
+        assert!(!id_of(&first).is_empty());
+        assert_ne!(id_of(&first), id_of(&second));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dry_run_sequence_is_shared_across_clones() -> Result<()> {
+        // KcsClient is cloned to share the connection pool. A per-clone counter
+        // would mint colliding synthetic ids across those clones.
+        let server = MockServer::start().await;
+        let client = v1_client(&server.uri(), "tok")?.with_dry_run(true);
+        let clone = client.clone();
+
+        let a = client.post("/policies/scanner", &json!({})).await?;
+        let b = clone.post("/policies/scanner", &json!({})).await?;
+        assert_ne!(a["id"], b["id"]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn writes_are_sent_when_dry_run_is_off() -> Result<()> {
+        // The twin of the suppression test: proves with_dry_run(false) is not
+        // silently suppressing everything.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/policies/scanner"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({"id": "real"})))
+            .mount(&server)
+            .await;
+
+        let client = v1_client(&server.uri(), "tok")?.with_dry_run(false);
+        let out = client.post("/policies/scanner", &json!({})).await?;
+        assert_eq!(out["id"], "real");
+        assert_eq!(
+            server.received_requests().await.unwrap_or_default().len(),
+            1
         );
         Ok(())
     }

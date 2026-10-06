@@ -1,118 +1,111 @@
 # kcs-migrator
 
-A Rust CLI tool that exports the full configuration of a running Kaspersky Container Security (KCS) 2.4 instance via its REST API and replays it on a fresh instance in the correct dependency order.
+A Rust CLI that exports the configuration of a running Kaspersky Container Security (KCS)
+instance and replays it onto another one in dependency order.
+
+Supports **KCS 2.4 and 2.5+**, detecting which REST API generation an instance speaks and
+translating bundle contents between them where the schemas differ.
 
 ---
 
-## Quick Start
+## KCS versions and API generations
 
-DATA for tool:
+KCS serves several API generations side by side under `/api/v1/`, `/api/v2/` and `/api/v3/`:
 
-**KCS URL**: `https://kcs.demo.lab/api`
-**Token**: `kcs_TEST1234567890`
-**Namespace**: `kcs`
+| KCS release | Generations served | What this tool uses |
+|---|---|---|
+| 2.4 and earlier | `v1` | `v1` |
+| 2.5 | `v1` (compatibility shim), `v2`, `v3` | **`v3`** |
+| 2.6 (expected) | `v3`; `v1` deprecated | `v3` |
 
-### Export command
+`GET /api/{v}/healthz` answers `{"version":"2.5.0"}` on every generation, so the tool
+probes it and picks `v1` below KCS 2.5.0 and `v3` from 2.5.0 on. Pass
+`--api-version v1|v3` to skip detection entirely — useful when `/healthz` is blocked by a
+proxy. An explicit `--api-version` sends **no** probe request at all.
+
+`v2` is not used. It exists on the server, but no product documentation references it, so
+there is no basis for choosing it over `v1` or `v3`.
+
+### What changes between v1 and v3
+
+These are the differences that matter to a migration. Each was established by diffing live
+per-item `GET` responses for the same object through both generations on a KCS 2.5.0
+instance — the published v3 OpenAPI document is stale in places and was not used as the
+source of truth.
+
+| Resource | APIv1 | APIv3 |
+|---|---|---|
+| agent group | `fileThreatProtectionProxyUrl` | `networkSettingsProxyUrl` |
+| agent group | `networkReputationSource` | `networkSettingsSource` |
+| agent group | `fileThreatProtectionMalwareDbUrl` | *removed* |
+| assurance policy | `failCICDStep` | `failExternalScansStep` |
+| assurance policy | inline `customControls` | own resource, `/policies/assurance-control` |
+| runtime profile | `auditWritEvents` | `auditWriteEvents` |
+| runtime profile | `auditRenameOrEvents` | `auditRenameOrMoveEvents` |
+| runtime policy | admission controls inline | own resource, `/policies/admission-controller` |
+| image registry | — | *no change* |
+
+The last row matters: the v3 OpenAPI document omits `pullMode` and `repositoryPathMode`
+from the registry schema, but the server returns both and the v1/v3 payloads are
+byte-identical. Trusting the document would have corrupted every registry.
+
+Translation is **forward-only**. Importing a v3 bundle into a v1 target is refused before
+any request is sent, because KCS 2.5 resources such as admission-controller policies and
+custom benchmark frameworks have no equivalent in 2.4. Export from the older instance
+instead.
+
+---
+
+## Quick start
 
 ```bash
-# Export all KCS configuration to /tmp/kcs-bundles/
-./target/release/kcs-migrator export \
-  --url https://kcs.demo.lab/api \
-  --token kcs_TEST1234567890 \
+# Put the token in a file rather than on the command line: an argument is
+# visible to every process on the host and lands in shell history.
+printf '%s' 'kcs_YOURTOKENHERE' > ~/.kcs-token && chmod 600 ~/.kcs-token
+
+# Export. The API generation is detected from the instance.
+kcs-migrator export \
+  --url https://kcs.source.example/api \
+  --token-file ~/.kcs-token \
   --no-verify-tls \
-  --output /tmp/kcs-bundles \
-  --namespace kcs
-```
+  --output /tmp/kcs-bundles
 
-### Import command
+# See exactly what an import would do, without writing anything.
+kcs-migrator import-bundle /tmp/kcs-bundles/kcs-export-2026-10-06_12-00-00 \
+  --url https://kcs.target.example/api \
+  --token-file ~/.kcs-target-token \
+  --no-verify-tls \
+  --dry-run
 
-```bash
-./target/release/kcs-migrator import-bundle \
-  /tmp/kcs-bundles/kcs-export-2026-05-21_16-58-53 \
-  --url https://kcs-target.demo.lab/api \
-  --token <TARGET_TOKEN> \
+# Then do it for real.
+kcs-migrator import-bundle /tmp/kcs-bundles/kcs-export-2026-10-06_12-00-00 \
+  --url https://kcs.target.example/api \
+  --token-file ~/.kcs-target-token \
   --no-verify-tls
 ```
 
----
+The token is on the **My profile** page of the KCS web console.
 
-## Architecture
+### Before you import
 
-The crate is split into a reusable library (`kcs_migrator`) and a thin CLI binary (`kcs-migrator`). The binary owns only the clap argument parsing and the `main` entry point; everything else lives in the library so it can be consumed from integration tests, doctests, or downstream tooling.
-
-```
-src/
-├── main.rs        CLI entry point (clap subcommands: export, import-bundle)
-├── lib.rs         Library crate root — re-exports the modules below
-├── client.rs      KcsClient — async reqwest wrapper, injects Tron-Token header
-├── export.rs      export_all() — orchestrates per-section helpers, writes versioned bundle
-├── importer.rs    import_bundle() — 14-step pipeline of single-responsibility helpers
-├── id_mapper.rs   IdMapper — source-id → target-id registry for FK rewriting
-└── users.rs       export_users_reference() — kubectl exec into postgres pod
-```
-
-`export_all` and `import_bundle` are short orchestrators that call per-section / per-step helpers in a fixed order. Each helper carries its own `///` docblock describing its inputs, outputs, and failure modes. See the module-level `//!` docs (`cargo doc --open`) for the full reference.
-
-**Graceful-skip behavior**: image registries with credential-based auth (`user_password`, `service_account`, …) and previously-deployed agent groups return HTTP 400 on re-POST because credentials and `deploymentToken`s cannot be replayed. The importer catches the 400, emits an `OPERATOR ACTION REQUIRED` warning, and continues with the next resource. All other failures abort the import.
-
----
-
-## Building
-
-### Prerequisites
-
-- Rust 1.75+ (install via [rustup](https://rustup.rs))
-- No system OpenSSL needed — TLS is handled by rustls (statically linked)
-
-### Local build (macOS / Linux)
-
-```bash
-# Debug build (fast compile, slower binary)
-cargo build
-
-# Release build (optimised, ~5 MB binary)
-cargo build --release
-
-# Binary location
-./target/release/kcs-migrator
-```
-
-### Building on the target Linux host (no cross-compile needed)
-
-```bash
-# 1. Install Rust on the remote machine
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
-
-# 2. Install the C linker (required once)
-sudo apt-get install -y gcc
-
-# 3. Copy source and build
-scp -r kcs_migrator/ user@host:/tmp/kcs_migrator
-ssh user@host "cd /tmp/kcs_migrator && ~/.cargo/bin/cargo build --release"
-```
-
-### Running the test suite
-
-```bash
-cargo test           # all unit + doctests
-cargo test --doc     # doctests only (requires the library crate)
-cargo +nightly fmt -- --check
-cargo clippy --all-targets -- -D warnings
-```
-
-26 unit tests + 3 doctests run in ~0.15 s. They mock HTTP at the transport level (wiremock) and use tmpdir bundles — no live KCS instance required.
+**An interrupted import cannot be re-run.** The POSTs are not idempotent and the
+source-to-target ID mapping lives only in memory, so a second run creates duplicates of
+everything the first run succeeded at, and the foreign keys in the later steps point at the
+first run's resources. If an import fails partway, inspect the target and finish by hand —
+do not re-run it. Use `--dry-run` first; that is what it is for.
 
 ---
 
 ## URL convention
 
-KCS exposes its frontend on `/` and its REST API under `/api/v1/`. Always pass the base URL **with the `/api` suffix**:
+Pass the base URL **with the `/api` suffix and without a version segment** — the tool adds
+`/v1` or `/v3` itself.
 
-| Connection method | `--url` value |
+| Connection method | `--url` |
 |---|---|
-| Via DNS name | `https://kcs.demo.lab/api` |
-| Via ingress IP + `--host-header` | `https://10.160.200.5/api` |
-| Via SSH tunnel (`localhost:8443`) | `https://localhost:8443/api` |
+| By DNS name | `https://kcs.demo.lab/api` |
+| By ingress IP with a Host override | `https://10.160.200.5/api` plus `--host-header kcs.demo.lab` |
+| Through an SSH tunnel | `https://localhost:8443/api` |
 
 ---
 
@@ -121,180 +114,277 @@ KCS exposes its frontend on `/` and its REST API under `/api/v1/`. Always pass t
 ```
 kcs-migrator <SUBCOMMAND>
 
-SUBCOMMANDS:
-    export          Export KCS configuration to a timestamped bundle directory
-    import-bundle   Restore a bundle to a target KCS instance
+  export          Export KCS configuration to a timestamped bundle directory
+  import-bundle   Restore a bundle to a target KCS instance
 ```
+
+### Connection options (both subcommands)
+
+| Option | Default | Notes |
+|---|---|---|
+| `--url <URL>` | — | Base URL including `/api`. Env: `KCS_URL` |
+| `--token <TOKEN>` | — | Env: `KCS_TOKEN`. Prefer `--token-file` |
+| `--token-file <PATH>` | — | First line of the file, trimmed. Takes precedence over `--token` |
+| `--no-verify-tls` | off | Accept self-signed certificates |
+| `--host-header <HOST>` | — | Override the HTTP `Host` header |
+| `--api-version <auto\|v1\|v3>` | `auto` | `auto` probes `GET /healthz`; `v1`/`v3` send no probe |
+| `--timeout-secs <N>` | `120` | Whole-request deadline, including body download |
+| `--connect-timeout-secs <N>` | `10` | TCP connect plus TLS handshake |
+
+The request timeout is generous because the network-reputation export returns a blob of
+unbounded size. Lower it if your instance is close by.
 
 ### `export`
 
-Fetches all exportable resources from the source KCS instance and writes them to a bundle directory named `kcs-export-YYYY-MM-DD_HH-MM-SS/` inside `--output`.
-
-```
-kcs-migrator export [OPTIONS]
-
-OPTIONS:
-    --url <URL>                       KCS base URL including /api  [env: KCS_URL]
-    --token <TOKEN>                   API token (Tron-Token header value)  [env: KCS_TOKEN]
-    --output <DIR>                    Directory to write the bundle into  [default: .]
-    --no-verify-tls                   Skip TLS certificate verification
-    --host-header <HOST>              Override the HTTP Host header (useful when connecting via IP)
-    --namespace <NS>                  Kubernetes namespace for the kubectl user export  [default: kcs]
-    --users-pod-selector <NAME>       StatefulSet name of the KCS Postgres pod  [default: kcs-postgresql]
-    --skip-users                      Skip the kubectl exec user export step
-```
+| Option | Default | Notes |
+|---|---|---|
+| `--output <DIR>` | `.` | Bundle is written to `<DIR>/kcs-export-<UTC timestamp>/` |
+| `--namespace <NS>` | `kcs` | Namespace for the `kubectl exec` user export |
+| `--users-pod-selector <NAME>` | `kcs-postgresql` | StatefulSet name of the KCS Postgres pod |
+| `--skip-users` | off | Skip the user export; no `kubectl` access needed |
 
 ### `import-bundle`
 
-Reads a bundle directory and recreates all resources on the target KCS instance in dependency order.
-
-```
-kcs-migrator import-bundle <BUNDLE> [OPTIONS]
-
-ARGS:
-    <BUNDLE>    Path to the bundle directory (e.g. ./kcs-export-2026-05-21_16-58-53)
-
-OPTIONS:
-    --url <URL>      Target KCS base URL including /api  [env: KCS_URL]
-    --token <TOKEN>  API token  [env: KCS_TOKEN]
-    --no-verify-tls  Skip TLS certificate verification
-```
+| Argument / option | Default | Notes |
+|---|---|---|
+| `<BUNDLE>` | — | Path to the bundle directory |
+| `--dry-run` | off | Resolve and describe every call; send no writes |
+| `--strict-notifications` | off | Abort instead of continuing when a response policy references an unmappable notification channel |
 
 ---
 
 ## Bundle format
 
-A bundle is a single timestamped directory:
+A bundle is one timestamped directory. `manifest.json` is written **last**, so its absence
+marks an interrupted export — and an import refuses such a directory before contacting the
+target.
 
 ```
-kcs-export-2026-05-21_16-58-53/
-├── manifest.json                              tool version + timestamp + source URL
+kcs-export-2026-10-06_12-00-00/
+├── manifest.json                              format version, source release, API generation
 ├── integrations/
 │   ├── image-registries.json
 │   ├── ldap.json
 │   ├── sso.json
 │   ├── llm.json
+│   ├── siem.json
+│   ├── external-groups.json
 │   ├── agent-groups.json
-│   ├── notifications-REFERENCE.json           reference only — cannot be auto-imported
-│   └── sign-validators-REFERENCE.json         reference only — cannot be auto-imported
+│   ├── notifications-REFERENCE.json            reference only — no create endpoint
+│   └── sign-validators-REFERENCE.json          reference only — no create endpoint
 ├── policies/
 │   ├── scanner.json
 │   ├── assurance.json
+│   ├── assurance-controls.json                 KCS 2.5+
+│   ├── admission-controller.json               KCS 2.5+
+│   ├── admission-controls.json                 KCS 2.5+
 │   ├── runtime-profiles.json
 │   ├── runtime.json
 │   ├── response.json
-│   └── network-reputation.bin                 raw binary
-├── components/
-│   └── scanner-priority.json
-├── config/
-│   └── reports-storage.json
-└── users-REFERENCE.json                       reference only — exported via kubectl exec
+│   ├── custom-reputation.json                  which reputation list is active
+│   └── network-reputation.bin                  opaque blob, replayed verbatim
+├── benchmark/
+│   ├── frameworks.json                         KCS 2.5+, custom only
+│   └── controls.json                           KCS 2.5+, custom only
+├── CEL/
+│   ├── benchmark/control/<slug>.cel
+│   ├── policies/assurance-control/<slug>.cel
+│   └── policies/admission-controller/control/<slug>.cel
+├── components/scanner-priority.json
+├── config/reports-storage.json
+├── security/scopes-REFERENCE.json              GET-only; used to remap scopes by name
+└── users-REFERENCE.json                        reference only — exported via kubectl exec
 ```
 
-**`-REFERENCE` files** are exported for visibility but cannot be replayed automatically because the API has no create/update endpoint for them (notification channels, sign validators) or because credentials are not stored in the bundle (users). Operator recreates these manually.
+### `manifest.json`
+
+```json
+{
+  "tool_version": "0.2.0",
+  "bundle_format": 2,
+  "timestamp": "2026-10-06_12-00-00",
+  "source_url": "https://kcs.source.example/api",
+  "kcs_version": "2.4.1",
+  "api_version": "v1"
+}
+```
+
+`api_version` is the field the importer cannot work without: it decides whether the bodies
+need translating. A manifest with no `bundle_format` was written by 0.1.0, which only
+spoke APIv1; such bundles still import.
+
+### CEL rules
+
+KCS 2.5 lets you write benchmark, assurance and admission controls in CEL. The API carries
+each rule as a JSON string, so a multi-line expression arrives as one line of escapes —
+unreadable and impossible to review in a diff. Export writes the rule to a `.cel` file
+verbatim and leaves a pointer:
+
+```json
+{ "name": "no-root-containers", "rule": { "$celFile": "CEL/benchmark/control/CTRL-0001.cel" } }
+```
+
+Import reads the file back before POSTing, so **the rules are editable by hand between
+export and import** — which is the point of keeping them outside the JSON. Pointers must
+stay inside the bundle; an absolute path or one containing `..` is refused.
+
+`CEL/benchmark/framework/` does not exist: a framework is a named set of references to
+controls and has no `rule` field of its own. The CEL lives in the controls.
+
+### `-REFERENCE` files
+
+Exported for visibility, never replayed, because the API has no create endpoint
+(notification channels, image signature validators, security scopes) or because the bundle
+holds no credentials for them (user accounts).
 
 ---
 
 ## Import dependency order
 
-Resources are created in this fixed sequence so that foreign-key references resolve correctly:
+Whatever owns an ID is created before whatever references it.
 
-1. Reports storage config
-2. Scanner priority
-3. LDAP (full replace via PUT)
-4. SSO
-5. LLM
-6. Image registries → registers `image-registry` IDs in IdMapper; credential-based registries gracefully skip on HTTP 400 (no credentials in bundle)
-7. Agent groups → registers `agent-group` IDs; gracefully skips on HTTP 400 (server-issued `deploymentToken` cannot be replayed)
-8. Scanner policies → enables each if `enabled: true`
-9. Assurance policies → enables each if `enabled: true`
-10. Runtime profiles → registers `runtime-profile` IDs
-11. Runtime policies — rewrites `runtimeProfileId` in each match block via IdMapper
-12. Notification channels — prints operator warning, no API import
-13. Response policies — rewrites `notificationSettingsIds` via IdMapper; aborts if any ID is unmapped
-14. Network reputation binary (raw PUT)
+| # | Step | Notes |
+|---|---|---|
+| 1 | Reports storage config | |
+| 2 | Scanner priority | |
+| 3 | Security scopes | read-only; matches bundle scopes to the target **by name** |
+| 4 | LDAP | `POST`, then `/{id}/enable` |
+| 5 | SSO | `POST`, then `/enable` |
+| 6 | LLM | |
+| 7 | SIEM integrations | |
+| 8 | Image registries | registers IDs; HTTP 400 skips with a warning |
+| 9 | External scan groups | |
+| 10 | Agent groups | translated; HTTP 400 skips with a warning |
+| 11 | Benchmark controls | KCS 2.5+; CEL inlined |
+| 12 | Benchmark frameworks | KCS 2.5+; then `/{id}/enable` |
+| 13 | Assurance controls | KCS 2.5+; CEL inlined |
+| 14 | Scanner policies | then `/{id}/enable` |
+| 15 | Assurance policies | translated; then `/{id}/enable` |
+| 16 | Admission controls | KCS 2.5+; CEL inlined |
+| 17 | Admission-controller policies | KCS 2.5+ |
+| 18 | Runtime profiles | translated; registers IDs |
+| 19 | Runtime policies | rewrites `runtimeProfileId`; splits off an admission policy from an APIv1 bundle |
+| 20 | Notification channels | warning only — no create endpoint exists |
+| 21 | Response policies | unmappable channels dropped with a warning |
+| 22 | Custom-reputation list selection | |
+| 23 | Network-reputation blob | raw `PUT` |
 
----
+Steps 11–13 and 16–17 are the resource classes KCS 2.5 introduced. Against an APIv1 target
+they are skipped without a request, because 2.4 has no route for them and a 404 would abort
+the import.
 
-## Demo environment — example commands
+### Graceful skips
 
-**KCS URL**: `https://kcs.demo.lab/api`
-**Token**: `kcs_TEST1234567890`
-**Namespace**: `kcs`
-
-### Do export
-
-```bash
-# Export all KCS configuration to /tmp/kcs-bundles/
-./target/release/kcs-migrator export \
-  --url https://kcs.demo.lab/api \
-  --token kcs_TEST1234567890 \
-  --no-verify-tls \
-  --output /tmp/kcs-bundles \
-  --namespace kcs
-```
-
-Expected output:
-```
-Bundle exported to: /tmp/kcs-bundles/kcs-export-2026-05-21_16-58-53
-User reference exported successfully.
-```
-
-### Export without user export (no kubectl access needed)
-
-```bash
-./target/release/kcs-migrator export \
-  --url https://kcs.demo.lab/api \
-  --token kcs_TEST1234567890 \
-  --no-verify-tls \
-  --output /tmp/kcs-bundles \
-  --skip-users
-```
-
-### Export via ingress IP with Host header override
-
-Useful when DNS resolution for `kcs.demo.lab` is not available:
-
-```bash
-./target/release/kcs-migrator export \
-  --url https://10.160.200.5/api \
-  --token kcs_TEST1234567890 \
-  --no-verify-tls \
-  --host-header kcs.demo.lab \
-  --output /tmp/kcs-bundles \
-  --skip-users
-```
-
-### Import a bundle to a target instance
-
-```bash
-./target/release/kcs-migrator import-bundle \
-  /tmp/kcs-bundles/kcs-export-2026-05-21_16-58-53 \
-  --url https://kcs-target.demo.lab/api \
-  --token <TARGET_TOKEN> \
-  --no-verify-tls
-```
-
-### Using environment variables instead of flags
-
-```bash
-export KCS_URL=https://kcs.demo.lab/api
-export KCS_TOKEN=kcs_TEST1234567890
-
-kcs-migrator export --no-verify-tls --output /tmp/kcs-bundles
-kcs-migrator import-bundle /tmp/kcs-bundles/kcs-export-2026-05-21_16-58-53 --no-verify-tls
-```
+Some resources cannot be replayed even with a complete body. Image registries using
+credential-based auth and previously-deployed agent groups return HTTP 400, because the
+bundle holds no credentials and the target mints its own deployment token. Those emit an
+`OPERATOR ACTION REQUIRED` warning naming the resource and the import continues. Scanner
+and assurance policies do **not** skip on 400 — there a 400 means the body is wrong, and
+hiding it would hide a translation bug.
 
 ---
 
 ## Secrets and manual steps
 
-Sensitive fields (`bindPassword`, `clientSecret`, registry passwords, LLM API keys) are returned as `***` by the KCS API and stored as placeholders in the bundle. After import, re-enter them in the target web UI.
+Sensitive fields (`bindPassword`, `clientSecret`, registry passwords, LLM API keys) are
+returned as `***` by the KCS API and stored as placeholders. Re-enter them in the target
+console after import.
+
+`deploymentToken` is **not** masked by the API — it comes back in full, and it is a live
+credential that enrols a node-agent into the instance that issued it. It is therefore
+stripped at export rather than written to the bundle. Nothing is lost: the target mints its
+own when an agent group is created.
 
 | Resource | Why manual |
 |---|---|
-| Notification channels (email / Telegram / webhook) | No POST/PUT API endpoint |
-| Image signature validators | No POST/PUT API endpoint |
-| User accounts | Credentials not stored in bundle; exported as reference via `kubectl exec` |
-| License key | Manual activation in target UI |
-| SIEM / syslog / Vault / proxy / Cilium | Helm values only, not in the API |
+| Notification channels (email / Telegram / webhook) | No create endpoint in any generation |
+| Image signature validators | No create endpoint |
+| Security scopes | `/security/scopes` is GET-only. Create them on the target **with the same names** before importing, and references are remapped automatically |
+| User accounts | Credentials not in the bundle; exported as reference via `kubectl exec` |
+| License key | Activate in the target console |
+| Syslog, Vault, proxy, Cilium | Helm values, not in the API |
+
+SIEM integrations **are** migrated — they have a full CRUD API in both generations and
+their create body carries no credentials. Earlier versions of this document said SIEM was
+configurable only through Helm values; that was wrong.
+
+---
+
+## Building
+
+### Prerequisites
+
+- Rust 1.98.1 or newer (`rust-version` in `Cargo.toml`), via [rustup](https://rustup.rs)
+- No system OpenSSL: TLS is rustls, statically linked
+
+```bash
+cargo build --release      # ./target/release/kcs-migrator
+```
+
+### On a remote Linux host
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+sudo apt-get install -y gcc          # C linker, once
+scp -r kcs_migrator/ user@host:/tmp/kcs_migrator
+ssh user@host "cd /tmp/kcs_migrator && ~/.cargo/bin/cargo build --release"
+```
+
+`Cargo.lock` is committed, so a build from a clean checkout is reproducible.
+
+---
+
+## Tests
+
+```bash
+cargo +nightly fmt -- --check
+cargo build                                            # see note
+cargo build --release
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test
+cargo test --doc
+cargo doc --no-deps                                    # must emit zero warnings
+```
+
+145 unit tests, 8 doctests and 2 compile-fail cases. HTTP is mocked at the transport layer
+with `wiremock` and bundles are built in temp directories, so no live KCS instance is
+needed.
+
+`cargo build` is listed separately on purpose: dev-dependencies are visible to the test
+build and absent from the real one, so a `use wiremock::…` that drifts into `src/` passes a
+green test run and fails the first time someone builds the crate.
+
+The crate sets `#![forbid(unsafe_code)]` and enables `clippy::pedantic` and
+`clippy::nursery`. The compile-fail cases under `tests/ui/` pin two borrow guarantees on
+`IdMapper`; if they fail after a toolchain upgrade, read `tests/ui.rs` before regenerating
+the snapshots.
+
+---
+
+## Architecture
+
+A reusable library (`kcs_migrator`) plus a thin binary (`kcs-migrator`) that owns only
+argument parsing and `main`.
+
+| Module | Responsibility |
+|---|---|
+| `version` | Parses the KCS release and picks an API generation |
+| `cli` | Connection options shared by both subcommands, and how they become a client |
+| `client` | Async `reqwest` wrapper; injects `Tron-Token`, applies the version prefix and the timeouts |
+| `bundle` | `manifest.json`: format version, source release, API generation |
+| `cel` | CEL rules as `.cel` text files instead of escaped JSON strings |
+| `export` | Walks a source instance into a bundle directory |
+| `translate` | Rewrites bundle bodies between API generations, forward-only |
+| `importer` | Replays a bundle in dependency order, rewriting foreign keys |
+| `id_mapper` | Source-to-target ID registry used for those rewrites |
+| `users` | Reference-only user export via `kubectl exec` |
+
+The API generation lives in exactly one place: `KcsClient` applies the `/v1` or `/v3`
+prefix, and call sites pass version-relative paths like `/policies/scanner`. A test fails
+if a versioned literal reappears in `export.rs` or `importer.rs`.
+
+See the module-level docs (`cargo doc --open`) for the full reference. Each module that
+does I/O carries a cancel-safety verdict, and the two public entry points — `export_all`
+and `import_bundle` — carry their own: export is cancel-safe and leaves a detectably
+incomplete bundle; **import is not cancel-safe**, which is why an interrupted import must
+not be re-run.

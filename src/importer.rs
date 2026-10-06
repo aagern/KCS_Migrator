@@ -13,7 +13,7 @@
 //!  2  scanner priority
 //!  3  security scopes            read-only; matches bundle scopes to the target by name
 //!  4  LDAP                       POST + /{id}/enable
-//!  5  SSO
+//!  5  SSO                        POST + /enable
 //!  6  LLM
 //!  7  SIEM integrations
 //!  8  image registries           registers IDs; 400 -> skip + warn
@@ -34,6 +34,35 @@
 //! 22  custom-reputation list selection
 //! 23  network-reputation blob
 //! ```
+//!
+//! # Cancel safety
+//!
+//! **Nothing in this module is cancel-safe.** Dropping an import future
+//! mid-pipeline leaves the target partially populated *and* discards the
+//! [`IdMapper`], which lives inside the dropped future. That mapper is the
+//! only record of which source IDs were already created, so after a cancel
+//! there is no way to resume: a second run creates duplicates of
+//! everything the first succeeded at, and the foreign-key rewrites in
+//! steps 12, 17, 19 and 21 silently reference the first run's resources.
+//!
+//! Consequences, for callers:
+//!
+//! - Do **not** wrap [`import_bundle`] in `tokio::select!` or
+//!   `tokio::time::timeout`. Per-request deadlines belong on the client
+//!   ([`crate::client::Timeouts`]), where a timeout fails one request with
+//!   an error the pipeline can report, instead of discarding the pipeline.
+//! - `--dry-run` is the supported way to see what an import would do.
+//! - A cancelled or failed import is recovered by inspecting the target,
+//!   not by re-running.
+//!
+//! The individual `POST`/`PUT` calls are cancel-safe with respect to this
+//! process — see [`crate::client`] — but they are **not idempotent**: a
+//! dropped write may already have been applied by the server. That is what
+//! makes re-running unsafe, rather than merely wasteful.
+//!
+//! Making the importer resumable — persisting the mapper after each step,
+//! keying creates on a natural key — would change the on-target contract
+//! rather than just this module, and is deliberately out of scope.
 //!
 //! Steps 11-13 and 16-17 are the resource classes KCS 2.5 introduced. On an
 //! `APIv1` target they are skipped without a request, because 2.4 has no route
@@ -589,13 +618,26 @@ async fn import_ldap(client: &KcsClient, bundle: &Path, mapper: &mut IdMapper) -
     Ok(())
 }
 
-/// Replays the SSO integration via `POST /integrations/sso`.
+/// Replays the SSO integration via `POST /integrations/sso`, then
+/// `POST /integrations/sso/enable` if the source had it enabled.
+///
 /// No-op if the bundle file has no `clientId` (used as a "configured"
 /// sentinel since the export endpoint returns `{}` when unset).
+///
+/// The enable call is a separate endpoint from the create, the same as for
+/// LDAP and the policy classes. Omitting it left SSO configured but
+/// switched off on the target — which looks like a successful migration
+/// and logs nobody in.
 async fn import_sso(client: &KcsClient, bundle: &Path) -> Result<()> {
     let sso = read_json(&bundle.join("integrations/sso.json"))?;
-    if sso.get("clientId").is_some() {
-        client.post("/integrations/sso", &strip(&sso)).await?;
+    if sso.get("clientId").is_none() {
+        return Ok(());
+    }
+    let enabled = sso.get("enabled").and_then(Value::as_bool).unwrap_or(false);
+    client.post("/integrations/sso", &strip(&sso)).await?;
+    if enabled {
+        // Unlike LDAP, SSO is a singleton: the enable endpoint takes no id.
+        client.post("/integrations/sso/enable", &json!({})).await?;
     }
     Ok(())
 }
@@ -1239,6 +1281,13 @@ async fn import_network_reputation(client: &KcsClient, bundle: &Path) -> Result<
 ///
 /// Returns the populated [`IdMapper`] so callers (or tests) can
 /// inspect the source→target ID mappings that were made.
+///
+/// # Cancel safety
+///
+/// **Not cancel-safe.** See the module docs: a drop or a failure partway
+/// through leaves the target partially populated and the ID mapping lost,
+/// and re-running duplicates whatever already succeeded. Use `--dry-run`
+/// first, and recover a failed import by inspecting the target.
 ///
 /// # Errors
 ///
@@ -2905,6 +2954,92 @@ mod tests {
         assert!(at("/v3/integrations/external-group")? < at("/v3/policies/runtime-profile")?);
         // Assurance controls before assurance policies would run.
         assert!(at("/v3/policies/assurance-control")? < at("/v3/policies/admission-controller")?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sso_is_created_and_then_enabled() -> Result<()> {
+        // Same defect class as the LDAP enable: a separate endpoint from the
+        // create, so skipping it leaves SSO configured but switched off — which
+        // looks like a successful migration and logs nobody in. SSO is a
+        // singleton, so its enable endpoint takes no id.
+        let tmp = tempfile::tempdir()?;
+        let bundle = make_bundle(&tmp)?;
+        std::fs::write(
+            bundle.join("integrations/sso.json"),
+            serde_json::to_string(&json!({
+                "clientId": "kcs-oidc",
+                "enabled": true,
+                "issuerUrl": "https://idp.example.invalid",
+            }))?,
+        )?;
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/integrations/sso"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({"id": "sso-1"})))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/integrations/sso/enable"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .mount(&server)
+            .await;
+
+        let client = KcsClient::new(
+            &server.uri(),
+            "tok",
+            true,
+            None,
+            ApiVersion::V1,
+            Timeouts::default(),
+        )?;
+        import_bundle(&client, &bundle, &ImportOptions::default()).await?;
+
+        let seen = server.received_requests().await.unwrap_or_default();
+        assert!(
+            seen.iter()
+                .any(|r| r.url.path() == "/v1/integrations/sso/enable"),
+            "an enabled source SSO config must be enabled on the target"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn disabled_sso_is_created_but_not_enabled() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let bundle = make_bundle(&tmp)?;
+        std::fs::write(
+            bundle.join("integrations/sso.json"),
+            serde_json::to_string(&json!({"clientId": "kcs-oidc", "enabled": false}))?,
+        )?;
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/integrations/sso"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({"id": "s"})))
+            .mount(&server)
+            .await;
+
+        let client = KcsClient::new(
+            &server.uri(),
+            "tok",
+            true,
+            None,
+            ApiVersion::V1,
+            Timeouts::default(),
+        )?;
+        import_bundle(&client, &bundle, &ImportOptions::default()).await?;
+
+        assert!(
+            !server
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .iter()
+                .any(|r| r.url.path().ends_with("/enable")),
+            "a disabled source config must not be switched on"
+        );
         Ok(())
     }
 }

@@ -16,6 +16,20 @@
 //! POST-ready schema. List-only resources (reference dumps) can use
 //! `get_list` directly.
 
+//! # Cancel safety
+//!
+//! Every `async fn` here is cancel-safe. Each section writes whole files
+//! with [`std::fs::write`], so dropping the future at an `.await` leaves
+//! the files written so far and nothing half-written: the only filesystem
+//! mutation is the write of a complete buffer.
+//!
+//! What a cancel does leave behind is an **incomplete bundle directory**.
+//! That is made detectable rather than merely survivable:
+//! [`export_all`] writes `manifest.json` last, so its absence marks the
+//! bundle as unfinished, and [`crate::importer::import_bundle`] refuses
+//! such a directory before contacting the target. The ordering is
+//! load-bearing — a test pins it.
+
 use crate::bundle::Manifest;
 use crate::cel;
 use crate::client::{is_client_error, KcsClient};
@@ -176,6 +190,12 @@ async fn get_list_detailed(
 /// a `manifest.json` records the tool version, timestamp, and source
 /// URL. Files named `*-REFERENCE.json` are informational only — the
 /// importer will not attempt to replay them.
+///
+/// # Cancel safety
+///
+/// Cancel-safe. Dropping this future leaves the bundle files written so
+/// far, with no `manifest.json` — which is exactly how an interrupted
+/// export is recognised. Re-run the export; do not import the directory.
 ///
 /// # Errors
 ///

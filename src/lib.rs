@@ -62,15 +62,22 @@
 //! # Examples
 //!
 //! ```no_run
-//! use kcs_migrator::client::KcsClient;
+//! use kcs_migrator::client::{KcsClient, Timeouts};
 //! use kcs_migrator::{export, importer};
 //! use std::path::Path;
 //!
 //! # async fn run() -> anyhow::Result<()> {
-//! let source = KcsClient::new("https://kcs.src.corp", "tok", true, None)?;
+//! // `detect` probes the instance's release and pins the client to the
+//! // matching API generation.
+//! let (source, src_kcs) = KcsClient::detect(
+//!     "https://kcs.src.corp", "tok", true, None, Timeouts::default(),
+//! ).await?;
 //! let bundle = export::export_all(&source, Path::new(".")).await?;
 //!
-//! let target = KcsClient::new("https://kcs.tgt.corp", "tok", true, None)?;
+//! let (target, tgt_kcs) = KcsClient::detect(
+//!     "https://kcs.tgt.corp", "tok", true, None, Timeouts::default(),
+//! ).await?;
+//! println!("migrating KCS {src_kcs} → KCS {tgt_kcs}");
 //! let mapper = importer::import_bundle(&target, &bundle).await?;
 //! # Ok(())
 //! # }

@@ -13,7 +13,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
-use kcs_migrator::client::KcsClient;
+use kcs_migrator::client::{KcsClient, Timeouts};
 use kcs_migrator::{export, importer, users};
 
 #[derive(Parser)]
@@ -73,7 +73,18 @@ async fn main() -> Result<()> {
             skip_users,
         } => {
             let verify_tls = !no_verify_tls;
-            let client = KcsClient::new(&url, &token, verify_tls, host_header.as_deref())?;
+            let (client, kcs) = KcsClient::detect(
+                &url,
+                &token,
+                verify_tls,
+                host_header.as_deref(),
+                Timeouts::default(),
+            )
+            .await?;
+            println!(
+                "Source is KCS {kcs}, exporting via API{}.",
+                client.api_version().prefix().trim_start_matches('/')
+            );
             let bundle = export::export_all(&client, &output).await?;
             println!("Bundle exported to: {}", bundle.display());
 
@@ -91,7 +102,12 @@ async fn main() -> Result<()> {
             no_verify_tls,
         } => {
             let verify_tls = !no_verify_tls;
-            let client = KcsClient::new(&url, &token, verify_tls, None)?;
+            let (client, kcs) =
+                KcsClient::detect(&url, &token, verify_tls, None, Timeouts::default()).await?;
+            println!(
+                "Target is KCS {kcs}, importing via API{}.",
+                client.api_version().prefix().trim_start_matches('/')
+            );
             importer::import_bundle(&client, &bundle).await?;
             println!("Import complete.");
         }

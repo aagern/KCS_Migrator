@@ -119,18 +119,18 @@ async fn enable_policy(client: &KcsClient, endpoint: &str, tgt_id: &str) -> Resu
 }
 
 /// Replays the reports-storage configuration via
-/// `PUT /v1/reports/storage/config`. No-op if the bundle file is empty
+/// `PUT /reports/storage/config`. No-op if the bundle file is empty
 /// (the source instance never configured it).
 async fn import_reports_storage(client: &KcsClient, bundle: &Path) -> Result<()> {
     let cfg = read_json(&bundle.join("config/reports-storage.json"))?;
     if cfg.as_object().is_some_and(|o| !o.is_empty()) {
-        client.put_json("/v1/reports/storage/config", &cfg).await?;
+        client.put_json("/reports/storage/config", &cfg).await?;
     }
     Ok(())
 }
 
 /// Replays the scanner-priority configuration via
-/// `POST /v1/scanners/priority`. No-op if the bundle file contains no
+/// `POST /scanners/priority`. No-op if the bundle file contains no
 /// `controls` entries.
 async fn import_scanner_priority(client: &KcsClient, bundle: &Path) -> Result<()> {
     let priority = read_json(&bundle.join("components/scanner-priority.json"))?;
@@ -139,12 +139,12 @@ async fn import_scanner_priority(client: &KcsClient, bundle: &Path) -> Result<()
         .and_then(|c| c.as_array())
         .is_some_and(|a| !a.is_empty());
     if has_controls {
-        client.post("/v1/scanners/priority", &priority).await?;
+        client.post("/scanners/priority", &priority).await?;
     }
     Ok(())
 }
 
-/// Replays the LDAP integration via `PUT /v1/integrations/ldap`. The
+/// Replays the LDAP integration via `PUT /integrations/ldap`. The
 /// bundle stores LDAP as a single-element array (list endpoint) or a
 /// single object; both shapes are accepted. No-op if empty.
 async fn import_ldap(client: &KcsClient, bundle: &Path) -> Result<()> {
@@ -158,35 +158,33 @@ async fn import_ldap(client: &KcsClient, bundle: &Path) -> Result<()> {
         },
     );
     if data.as_object().is_some_and(|o| !o.is_empty()) {
-        client
-            .put_json("/v1/integrations/ldap", &strip(&data))
-            .await?;
+        client.put_json("/integrations/ldap", &strip(&data)).await?;
     }
     Ok(())
 }
 
-/// Replays the SSO integration via `POST /v1/integrations/sso`.
+/// Replays the SSO integration via `POST /integrations/sso`.
 /// No-op if the bundle file has no `clientId` (used as a "configured"
 /// sentinel since the export endpoint returns `{}` when unset).
 async fn import_sso(client: &KcsClient, bundle: &Path) -> Result<()> {
     let sso = read_json(&bundle.join("integrations/sso.json"))?;
     if sso.get("clientId").is_some() {
-        client.post("/v1/integrations/sso", &strip(&sso)).await?;
+        client.post("/integrations/sso", &strip(&sso)).await?;
     }
     Ok(())
 }
 
-/// Replays the LLM integration via `POST /v1/integrations/llm`.
+/// Replays the LLM integration via `POST /integrations/llm`.
 /// No-op if the bundle file has no `type` field.
 async fn import_llm(client: &KcsClient, bundle: &Path) -> Result<()> {
     let llm = read_json(&bundle.join("integrations/llm.json"))?;
     if llm.get("type").is_some() {
-        client.post("/v1/integrations/llm", &strip(&llm)).await?;
+        client.post("/integrations/llm", &strip(&llm)).await?;
     }
     Ok(())
 }
 
-/// Replays image registries via `POST /v1/integrations/image-registries`.
+/// Replays image registries via `POST /integrations/image-registries`.
 /// On success, records each `source_id → target_id` under resource
 /// type `"image-registry"` in `mapper`.
 ///
@@ -215,7 +213,7 @@ async fn import_image_registries(
         let src_id = src_id_from(reg);
         let name = name_or_id(reg, "registryName", &src_id).to_string();
         match client
-            .post("/v1/integrations/image-registries", &strip(reg))
+            .post("/integrations/image-registries", &strip(reg))
             .await
         {
             Ok(result) => {
@@ -234,7 +232,7 @@ async fn import_image_registries(
     Ok(())
 }
 
-/// Replays agent groups via `POST /v1/integrations/agent-group`. On
+/// Replays agent groups via `POST /integrations/agent-group`. On
 /// success, registers each `source_id → target_id` under resource type
 /// `"agent-group"` in `mapper`.
 ///
@@ -261,7 +259,7 @@ async fn import_agent_groups(
         let src_id = src_id_from(group);
         let name = name_or_id(group, "groupName", &src_id).to_string();
         match client
-            .post("/v1/integrations/agent-group", &strip(group))
+            .post("/integrations/agent-group", &strip(group))
             .await
         {
             Ok(result) => {
@@ -318,7 +316,7 @@ async fn import_simple_policy_collection(
     Ok(())
 }
 
-/// Replays runtime profiles via `POST /v1/policies/runtime-profile`.
+/// Replays runtime profiles via `POST /policies/runtime-profile`.
 /// Must run before [`import_runtime_policies`], because runtime
 /// policies reference runtime-profile IDs that the mapper rewrites
 /// using the registrations made here.
@@ -340,14 +338,14 @@ async fn import_runtime_profiles(
     for profile in &arr {
         let src_id = src_id_from(profile);
         let result = client
-            .post("/v1/policies/runtime-profile", &strip(profile))
+            .post("/policies/runtime-profile", &strip(profile))
             .await?;
         mapper.register("runtime-profile", &src_id, &tgt_id_from(&result));
     }
     Ok(())
 }
 
-/// Replays runtime policies via `POST /v1/policies/runtime`. Each
+/// Replays runtime policies via `POST /policies/runtime`. Each
 /// policy's `runtimeProfileMatchBlocks[*].runtimeProfileId` is
 /// rewritten from the source instance's ID space to the target's via
 /// `mapper` before the POST; see
@@ -374,11 +372,11 @@ async fn import_runtime_policies(
         let enabled = pol["enabled"].as_bool().unwrap_or(false);
         let mut body = strip(pol);
         rewrite_runtime_profile_match_blocks(&mut body, pol, &src_id, mapper)?;
-        let result = client.post("/v1/policies/runtime", &body).await?;
+        let result = client.post("/policies/runtime", &body).await?;
         let tgt_id = tgt_id_from(&result);
         mapper.register("runtime-policy", &src_id, &tgt_id);
         if enabled {
-            enable_policy(client, "/v1/policies/runtime", &tgt_id).await?;
+            enable_policy(client, "/policies/runtime", &tgt_id).await?;
         }
     }
     Ok(())
@@ -490,7 +488,7 @@ fn warn_notifications_reference(bundle: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Replays response policies via `POST /v1/policies/response`. Each
+/// Replays response policies via `POST /policies/response`. Each
 /// policy's `notificationSettingsIds` is rewritten from the source's
 /// ID space to the target's via `mapper`; see
 /// [`rewrite_notification_settings_ids`].
@@ -518,11 +516,11 @@ async fn import_response_policies(
         let enabled = pol["enabled"].as_bool().unwrap_or(false);
         let mut body = strip(pol);
         rewrite_notification_settings_ids(&mut body, pol, &src_id, mapper)?;
-        let result = client.post("/v1/policies/response", &body).await?;
+        let result = client.post("/policies/response", &body).await?;
         let tgt_id = tgt_id_from(&result);
         mapper.register("response-policy", &src_id, &tgt_id);
         if enabled {
-            enable_policy(client, "/v1/policies/response", &tgt_id).await?;
+            enable_policy(client, "/policies/response", &tgt_id).await?;
         }
     }
     Ok(())
@@ -573,7 +571,7 @@ fn rewrite_notification_settings_ids(
 }
 
 /// Uploads the network-reputation binary blob via
-/// `PUT /v1/policies/custom-reputation/import`. No-op if the bundle
+/// `PUT /policies/custom-reputation/import`. No-op if the bundle
 /// file is missing or empty.
 async fn import_network_reputation(client: &KcsClient, bundle: &Path) -> Result<()> {
     let path = bundle.join("policies/network-reputation.bin");
@@ -585,7 +583,7 @@ async fn import_network_reputation(client: &KcsClient, bundle: &Path) -> Result<
         return Ok(());
     }
     client
-        .put_bytes("/v1/policies/custom-reputation/import", data)
+        .put_bytes("/policies/custom-reputation/import", data)
         .await?;
     Ok(())
 }
@@ -610,12 +608,14 @@ async fn import_network_reputation(client: &KcsClient, bundle: &Path) -> Result<
 /// # Examples
 ///
 /// ```no_run
-/// use kcs_migrator::client::KcsClient;
+/// use kcs_migrator::client::{KcsClient, Timeouts};
 /// use kcs_migrator::importer;
 /// use std::path::Path;
 ///
 /// # async fn run() -> anyhow::Result<()> {
-/// let client = KcsClient::new("https://kcs.tgt.corp", "tok", true, None)?;
+/// let (client, _kcs) = KcsClient::detect(
+///     "https://kcs.tgt.corp", "tok", true, None, Timeouts::default(),
+/// ).await?;
 /// let mapper = importer::import_bundle(&client, Path::new("kcs-export-…")).await?;
 /// # let _ = mapper;
 /// # Ok(()) }
@@ -634,7 +634,7 @@ pub async fn import_bundle(client: &KcsClient, bundle: &Path) -> Result<IdMapper
         client,
         bundle,
         "policies/scanner.json",
-        "/v1/policies/scanner",
+        "/policies/scanner",
         "scanner-policy",
         &mut mapper,
     )
@@ -643,7 +643,7 @@ pub async fn import_bundle(client: &KcsClient, bundle: &Path) -> Result<IdMapper
         client,
         bundle,
         "policies/assurance.json",
-        "/v1/policies/assurance",
+        "/policies/assurance",
         "assurance-policy",
         &mut mapper,
     )
@@ -660,6 +660,8 @@ pub async fn import_bundle(client: &KcsClient, bundle: &Path) -> Result<IdMapper
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client::Timeouts;
+    use crate::version::ApiVersion;
     use serde_json::json;
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -720,7 +722,14 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = KcsClient::new(&server.uri(), "tok", true, None)?;
+        let client = KcsClient::new(
+            &server.uri(),
+            "tok",
+            true,
+            None,
+            ApiVersion::V1,
+            Timeouts::default(),
+        )?;
         let mapper = import_bundle(&client, &bundle).await?;
         assert_eq!(mapper.resolve("scanner-policy", "pol-src-1")?, "pol-tgt-99");
         Ok(())
@@ -754,7 +763,14 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = KcsClient::new(&server.uri(), "tok", true, None)?;
+        let client = KcsClient::new(
+            &server.uri(),
+            "tok",
+            true,
+            None,
+            ApiVersion::V1,
+            Timeouts::default(),
+        )?;
         let mapper = import_bundle(&client, &bundle).await?;
         assert_eq!(mapper.resolve("runtime-profile", "rp-src-1")?, "rp-tgt-1");
         assert_eq!(mapper.resolve("runtime-policy", "rt-src-1")?, "rt-tgt-1");
@@ -774,7 +790,14 @@ mod tests {
         )?;
 
         let server = MockServer::start().await;
-        let client = KcsClient::new(&server.uri(), "tok", true, None)?;
+        let client = KcsClient::new(
+            &server.uri(),
+            "tok",
+            true,
+            None,
+            ApiVersion::V1,
+            Timeouts::default(),
+        )?;
         let err = import_bundle(&client, &bundle).await.unwrap_err();
         assert!(err.to_string().contains("rp-ghost-99"));
         Ok(())
@@ -793,7 +816,14 @@ mod tests {
         )?;
 
         let server = MockServer::start().await;
-        let client = KcsClient::new(&server.uri(), "tok", true, None)?;
+        let client = KcsClient::new(
+            &server.uri(),
+            "tok",
+            true,
+            None,
+            ApiVersion::V1,
+            Timeouts::default(),
+        )?;
         let err = import_bundle(&client, &bundle).await.unwrap_err();
         assert!(err.to_string().contains("notif-unknown-99"));
         Ok(())
@@ -814,7 +844,14 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = KcsClient::new(&server.uri(), "tok", true, None)?;
+        let client = KcsClient::new(
+            &server.uri(),
+            "tok",
+            true,
+            None,
+            ApiVersion::V1,
+            Timeouts::default(),
+        )?;
         import_bundle(&client, &bundle).await?;
         Ok(())
     }
@@ -849,7 +886,14 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = KcsClient::new(&server.uri(), "tok", true, None)?;
+        let client = KcsClient::new(
+            &server.uri(),
+            "tok",
+            true,
+            None,
+            ApiVersion::V1,
+            Timeouts::default(),
+        )?;
         let mapper = import_bundle(&client, &bundle).await?;
         assert!(mapper.resolve("image-registry", "reg-cred-1").is_err());
         assert_eq!(
@@ -882,7 +926,14 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = KcsClient::new(&server.uri(), "tok", true, None)?;
+        let client = KcsClient::new(
+            &server.uri(),
+            "tok",
+            true,
+            None,
+            ApiVersion::V1,
+            Timeouts::default(),
+        )?;
         let mapper = import_bundle(&client, &bundle).await?;
         assert_eq!(mapper.resolve("image-registry", "reg-src-1")?, "reg-tgt-1");
         Ok(())

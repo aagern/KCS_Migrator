@@ -7,12 +7,12 @@
 //!
 //! # Why the per-item GETs
 //!
-//! KCS `GET /v1/<resource>` (list) returns a truncated projection of
+//! KCS `GET /<resource>` (list) returns a truncated projection of
 //! each item — often missing fields the `POST` endpoint requires
 //! (e.g. `scanTimeout` on image registries, `agentType` on agent
 //! groups). For resource classes that get re-`POST`ed during import,
 //! `get_list_detailed` composes the list response with per-item
-//! `GET /v1/<resource>/<id>` calls so the bundle records the full
+//! `GET /<resource>/<id>` calls so the bundle records the full
 //! POST-ready schema. List-only resources (reference dumps) can use
 //! `get_list` directly.
 
@@ -138,8 +138,8 @@ async fn get_single(client: &KcsClient, api_path: &str) -> Result<Value> {
 /// ```ignore
 /// let registries = get_list_detailed(
 ///     &client,
-///     "/v1/integrations/image-registries",
-///     "/v1/integrations/image-registries",
+///     "/integrations/image-registries",
+///     "/integrations/image-registries",
 /// ).await?;
 /// ```
 async fn get_list_detailed(
@@ -202,12 +202,15 @@ async fn get_list_detailed(
 /// # Examples
 ///
 /// ```no_run
-/// use kcs_migrator::client::KcsClient;
+/// use kcs_migrator::client::{KcsClient, Timeouts};
 /// use kcs_migrator::export;
 /// use std::path::Path;
 ///
 /// # async fn run() -> anyhow::Result<()> {
-/// let client = KcsClient::new("https://kcs.src.corp", "tok", true, None)?;
+/// let (client, kcs) = KcsClient::detect(
+///     "https://kcs.src.corp", "tok", true, None, Timeouts::default(),
+/// ).await?;
+/// println!("source is KCS {kcs}, speaking {:?}", client.api_version());
 /// let bundle = export::export_all(&client, Path::new(".")).await?;
 /// println!("bundle: {}", bundle.display());
 /// # Ok(()) }
@@ -244,8 +247,8 @@ pub async fn export_all(client: &KcsClient, output_dir: &Path) -> Result<PathBuf
 async fn export_integrations(client: &KcsClient, bundle: &Path) -> Result<()> {
     let registries = get_list_detailed(
         client,
-        "/v1/integrations/image-registries",
-        "/v1/integrations/image-registries",
+        "/integrations/image-registries",
+        "/integrations/image-registries",
     )
     .await?;
     write_json(
@@ -253,19 +256,19 @@ async fn export_integrations(client: &KcsClient, bundle: &Path) -> Result<()> {
         &registries,
     )?;
 
-    let ldap = get_list(client, "/v1/integrations/ldap").await?;
+    let ldap = get_list(client, "/integrations/ldap").await?;
     write_json(&bundle.join("integrations/ldap.json"), &ldap)?;
 
-    let sso = get_single(client, "/v1/integrations/sso").await?;
+    let sso = get_single(client, "/integrations/sso").await?;
     write_json(&bundle.join("integrations/sso.json"), &sso)?;
 
-    let llm = get_single(client, "/v1/integrations/llm").await?;
+    let llm = get_single(client, "/integrations/llm").await?;
     write_json(&bundle.join("integrations/llm.json"), &llm)?;
 
     let agent_groups = get_list_detailed(
         client,
-        "/v1/integrations/agent-group",
-        "/v1/integrations/agent-group",
+        "/integrations/agent-group",
+        "/integrations/agent-group",
     )
     .await?;
     write_json(
@@ -273,7 +276,7 @@ async fn export_integrations(client: &KcsClient, bundle: &Path) -> Result<()> {
         &agent_groups,
     )?;
 
-    let sign_validators = get_list(client, "/v1/integrations/sign-validators").await?;
+    let sign_validators = get_list(client, "/integrations/sign-validators").await?;
     write_json(
         &bundle.join("integrations/sign-validators-REFERENCE.json"),
         &sign_validators,
@@ -296,9 +299,9 @@ async fn export_integrations(client: &KcsClient, bundle: &Path) -> Result<()> {
 ///
 /// Returns the first transport, parse, or filesystem error.
 async fn export_notifications_reference(client: &KcsClient, bundle: &Path) -> Result<()> {
-    let email = get_list(client, "/v1/integrations/notification-settings/email").await?;
-    let telegram = get_list(client, "/v1/integrations/notification-settings/telegram").await?;
-    let webhook = get_list(client, "/v1/integrations/notification-settings/webhook").await?;
+    let email = get_list(client, "/integrations/notification-settings/email").await?;
+    let telegram = get_list(client, "/integrations/notification-settings/telegram").await?;
+    let webhook = get_list(client, "/integrations/notification-settings/webhook").await?;
     write_json(
         &bundle.join("integrations/notifications-REFERENCE.json"),
         &json!({"email": email, "telegram": telegram, "webhook": webhook}),
@@ -324,22 +327,22 @@ async fn export_notifications_reference(client: &KcsClient, bundle: &Path) -> Re
 ///
 /// Returns the first transport, parse, or filesystem error.
 async fn export_policies(client: &KcsClient, bundle: &Path) -> Result<()> {
-    let scanner = get_list(client, "/v1/policies/scanner").await?;
+    let scanner = get_list(client, "/policies/scanner").await?;
     write_json(&bundle.join("policies/scanner.json"), &scanner)?;
 
-    let assurance = get_list(client, "/v1/policies/assurance").await?;
+    let assurance = get_list(client, "/policies/assurance").await?;
     write_json(&bundle.join("policies/assurance.json"), &assurance)?;
 
-    let runtime_profiles = get_list(client, "/v1/policies/runtime-profile").await?;
+    let runtime_profiles = get_list(client, "/policies/runtime-profile").await?;
     write_json(
         &bundle.join("policies/runtime-profiles.json"),
         &runtime_profiles,
     )?;
 
-    let runtime = get_list(client, "/v1/policies/runtime").await?;
+    let runtime = get_list(client, "/policies/runtime").await?;
     write_json(&bundle.join("policies/runtime.json"), &runtime)?;
 
-    let response = get_list(client, "/v1/policies/response").await?;
+    let response = get_list(client, "/policies/response").await?;
     write_json(&bundle.join("policies/response.json"), &response)?;
 
     Ok(())
@@ -348,7 +351,7 @@ async fn export_policies(client: &KcsClient, bundle: &Path) -> Result<()> {
 /// # Overview
 ///
 /// Downloads the network-reputation blob via
-/// `GET /v1/policies/custom-reputation/export` and writes it to
+/// `GET /policies/custom-reputation/export` and writes it to
 /// `policies/network-reputation.bin` inside the bundle.
 ///
 /// The blob is opaque to the migrator — it's replayed verbatim during
@@ -361,7 +364,7 @@ async fn export_policies(client: &KcsClient, bundle: &Path) -> Result<()> {
 /// written.
 async fn export_network_reputation(client: &KcsClient, bundle: &Path) -> Result<()> {
     let bytes = client
-        .get_bytes("/v1/policies/custom-reputation/export")
+        .get_bytes("/policies/custom-reputation/export")
         .await?;
     let path = bundle.join("policies/network-reputation.bin");
     let parent = path
@@ -384,7 +387,7 @@ async fn export_network_reputation(client: &KcsClient, bundle: &Path) -> Result<
 ///
 /// Returns the first transport, parse, or filesystem error.
 async fn export_components(client: &KcsClient, bundle: &Path) -> Result<()> {
-    let scanner_priority = get_single(client, "/v1/scanners/priority").await?;
+    let scanner_priority = get_single(client, "/scanners/priority").await?;
     write_json(
         &bundle.join("components/scanner-priority.json"),
         &scanner_priority,
@@ -401,7 +404,7 @@ async fn export_components(client: &KcsClient, bundle: &Path) -> Result<()> {
 ///
 /// Returns the first transport, parse, or filesystem error.
 async fn export_config(client: &KcsClient, bundle: &Path) -> Result<()> {
-    let reports_storage = get_single(client, "/v1/reports/storage/config").await?;
+    let reports_storage = get_single(client, "/reports/storage/config").await?;
     write_json(
         &bundle.join("config/reports-storage.json"),
         &reports_storage,
@@ -433,6 +436,8 @@ fn write_manifest(bundle: &Path, ts: &str, source_url: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client::Timeouts;
+    use crate::version::ApiVersion;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -489,7 +494,14 @@ mod tests {
         stub_empty(&server).await;
 
         let tmp = tempfile::tempdir()?;
-        let client = KcsClient::new(&server.uri(), "tok", true, None)?;
+        let client = KcsClient::new(
+            &server.uri(),
+            "tok",
+            true,
+            None,
+            ApiVersion::V1,
+            Timeouts::default(),
+        )?;
         let bundle = export_all(&client, tmp.path()).await?;
 
         let data: Value = serde_json::from_str(&std::fs::read_to_string(
@@ -510,7 +522,14 @@ mod tests {
         stub_empty(&server).await;
 
         let tmp = tempfile::tempdir()?;
-        let client = KcsClient::new(&server.uri(), "tok", true, None)?;
+        let client = KcsClient::new(
+            &server.uri(),
+            "tok",
+            true,
+            None,
+            ApiVersion::V1,
+            Timeouts::default(),
+        )?;
         let bundle = export_all(&client, tmp.path()).await?;
 
         let manifest: Value =
@@ -531,7 +550,14 @@ mod tests {
         stub_empty(&server).await;
 
         let tmp = tempfile::tempdir()?;
-        let client = KcsClient::new(&server.uri(), "tok", true, None)?;
+        let client = KcsClient::new(
+            &server.uri(),
+            "tok",
+            true,
+            None,
+            ApiVersion::V1,
+            Timeouts::default(),
+        )?;
         let bundle = export_all(&client, tmp.path()).await?;
 
         let file_name = bundle
@@ -559,7 +585,14 @@ mod tests {
         stub_empty(&server).await;
 
         let tmp = tempfile::tempdir()?;
-        let client = KcsClient::new(&server.uri(), "tok", true, None)?;
+        let client = KcsClient::new(
+            &server.uri(),
+            "tok",
+            true,
+            None,
+            ApiVersion::V1,
+            Timeouts::default(),
+        )?;
         let bundle = export_all(&client, tmp.path()).await?;
 
         let notif: Value = serde_json::from_str(&std::fs::read_to_string(
@@ -587,7 +620,14 @@ mod tests {
         stub_empty(&server).await;
 
         let tmp = tempfile::tempdir()?;
-        let client = KcsClient::new(&server.uri(), "tok", true, None)?;
+        let client = KcsClient::new(
+            &server.uri(),
+            "tok",
+            true,
+            None,
+            ApiVersion::V1,
+            Timeouts::default(),
+        )?;
         let bundle = export_all(&client, tmp.path()).await?;
 
         let bin = std::fs::read(bundle.join("policies/network-reputation.bin"))?;

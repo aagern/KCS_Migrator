@@ -1,3 +1,30 @@
+#![forbid(unsafe_code)]
+#![warn(clippy::pedantic, clippy::nursery)]
+#![deny(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::todo,
+    clippy::unimplemented
+)]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        // Tests assert by panicking; a non-exhaustive match arm that should never be
+        // reached is clearer as `panic!` than as a contrived fallback value.
+        clippy::panic
+    )
+)]
+// pedantic; `version::KcsVersion` and `client::KcsClient` read better than `version::Kcs`:
+#![allow(clippy::module_name_repetitions)]
+// pedantic; every public fn here already carries a hand-written `# Errors` section, and the
+// lint also fires on private helpers where that docblock would be noise:
+#![allow(clippy::missing_errors_doc)]
+
 //! # Overview
 //!
 //! `kcs_migrator` is a two-phase migration toolkit for the KCS
@@ -17,31 +44,65 @@
 //!
 //! | Module | Responsibility |
 //! |---|---|
+//! | [`bundle`]    | The bundle `manifest.json`: format version, source release, API generation. |
+//! | [`cel`]       | CEL rules as editable `.cel` text files instead of escaped JSON strings. |
+//! | [`cli`]       | Connection options shared by the subcommands, and how they become a client. |
 //! | [`client`]    | Async [`reqwest`] wrapper that injects the `Tron-Token` auth header. |
 //! | [`export`]    | Dumps a source KCS to a versioned bundle directory. |
 //! | [`importer`]  | Replays a bundle onto a target KCS in dependency order. |
 //! | [`id_mapper`] | Source→target ID registry used during import to rewrite FK fields. |
+//! | [`translate`] | Rewrites bundle bodies between API generations (forward-only, v1 to v3). |
 //! | [`users`]     | Reference-only user export via `kubectl exec` against the KCS Postgres pod. |
+//! | [`version`]   | Which API generation an instance speaks, and how to tell from its release. |
+//!
+//! # API generations
+//!
+//! KCS serves several API generations side by side. KCS 2.4 and earlier
+//! only have `/api/v1/`; 2.5 added `/api/v3/` and keeps `v1` as a
+//! compatibility shim; 2.6 deprecates `v1`. The migrator detects the
+//! target's release from `GET /{v}/healthz` and picks a generation —
+//! see [`version::ApiVersion::for_kcs`].
 //!
 //! # Examples
 //!
 //! ```no_run
-//! use kcs_migrator::client::KcsClient;
+//! use kcs_migrator::client::{Connection, KcsClient, Timeouts};
 //! use kcs_migrator::{export, importer};
 //! use std::path::Path;
 //!
 //! # async fn run() -> anyhow::Result<()> {
-//! let source = KcsClient::new("https://kcs.src.corp", "tok", true, None)?;
-//! let bundle = export::export_all(&source, Path::new(".")).await?;
+//! // `detect` probes the instance's release and pins the client to the
+//! // matching API generation.
+//! let src = Connection {
+//!     base_url: "https://kcs.src.corp",
+//!     token: "tok",
+//!     verify_tls: true,
+//!     host_header: None,
+//!     timeouts: Timeouts::default(),
+//! };
+//! let (source, src_kcs) = KcsClient::detect(&src).await?;
+//! let bundle = export::export_all(&source, Path::new("."), Some(src_kcs)).await?;
 //!
-//! let target = KcsClient::new("https://kcs.tgt.corp", "tok", true, None)?;
-//! let mapper = importer::import_bundle(&target, &bundle).await?;
+//! let (target, tgt_kcs) = KcsClient::detect(&Connection {
+//!     base_url: "https://kcs.tgt.corp",
+//!     ..src
+//! })
+//! .await?;
+//! println!("migrating KCS {src_kcs} → KCS {tgt_kcs}");
+//! let mapper = importer::import_bundle(
+//!     &target, &bundle, &importer::ImportOptions::default(),
+//! ).await?;
 //! # Ok(())
 //! # }
 //! ```
 
+pub mod bundle;
+pub mod cel;
+pub mod cli;
 pub mod client;
 pub mod export;
 pub mod id_mapper;
 pub mod importer;
+pub mod translate;
 pub mod users;
+pub mod version;

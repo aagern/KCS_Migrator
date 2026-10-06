@@ -1,3 +1,12 @@
+/target
 binary
 .DS_Store
-Cargo.lock
+
+# Local tooling — see scripts/CLAUDE.md
+.claude/
+openspec/
+.code-review-graph/
+
+# Local working notes. Never commit, and never put credentials in one:
+# gitignored is not the same as safe.
+*.local.md

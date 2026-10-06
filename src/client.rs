@@ -8,13 +8,137 @@
 //!
 //! All higher-level modules ([`crate::export`], [`crate::importer`])
 //! talk to KCS exclusively through [`KcsClient`].
+//!
+//! # API generation
+//!
+//! A [`KcsClient`] is pinned to one [`ApiVersion`] and inserts that
+//! version's path prefix itself. Callers pass **version-relative**
+//! paths — `"/policies/scanner"`, not `"/v3/policies/scanner"` — so the
+//! generation lives in exactly one place. [`KcsClient::detect`] probes
+//! the instance and picks the generation from its release.
+//!
+//! # Cancel safety
+//!
+//! Every request method here is cancel-safe with respect to this
+//! process: dropping the returned future at an `.await` aborts the
+//! in-flight request and returns the connection to the pool, and
+//! `KcsClient` holds no `&mut` state that could be left half-updated.
+//!
+//! The write methods carry a caveat that cancel safety does not cover:
+//! a dropped [`KcsClient::post`], [`KcsClient::put_json`] or
+//! [`KcsClient::put_bytes`] may already have been received and applied
+//! by KCS. They are cancel-safe but **not idempotent**, so a cancelled
+//! import must not be retried by re-running it against the same target.
 
-use anyhow::{Context, Result};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::{anyhow, Context, Result};
 use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
+
+use crate::version::{self, ApiVersion, KcsVersion, VersionError};
 
 /// # Overview
 ///
-/// Authenticated HTTP client for a single KCS instance.
+/// Request deadlines for a [`KcsClient`].
+///
+/// A named struct rather than two `Duration` arguments: both fields have
+/// the same type, so a transposed call site is exactly the mistake the
+/// compiler cannot catch for us.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Timeouts {
+    /// Bounds the TCP connect plus TLS handshake.
+    pub connect: Duration,
+    /// Bounds the whole round trip, including downloading the body.
+    pub request: Duration,
+}
+
+impl Default for Timeouts {
+    /// Deliberately generous on `request`: the network-reputation export
+    /// returns a blob of unbounded size, and a per-item detail sweep over
+    /// a large registry is slow. Operators can lower it.
+    fn default() -> Self {
+        Self {
+            connect: Duration::from_secs(10),
+            request: Duration::from_secs(120),
+        }
+    }
+}
+
+/// # Overview
+///
+/// The HTTP status behind an [`anyhow::Error`] produced by this module,
+/// or `None` if the failure was not an HTTP status error.
+///
+/// Every caller that needs to branch on a status — the graceful-skip
+/// paths in [`crate::importer`], the "feature not configured" paths in
+/// [`crate::export`] — goes through this rather than repeating the
+/// downcast. Repeating it is how one site ends up checking `400` while
+/// its neighbour checks `400 || 404` for the same condition.
+#[must_use]
+pub fn error_status(e: &anyhow::Error) -> Option<reqwest::StatusCode> {
+    e.downcast_ref::<reqwest::Error>()
+        .and_then(reqwest::Error::status)
+}
+
+/// # Overview
+///
+/// Whether an error is an HTTP 4xx.
+///
+/// Used where a 4xx means "this feature was never configured on the
+/// source" rather than a failure worth aborting for.
+#[must_use]
+pub fn is_client_error(e: &anyhow::Error) -> bool {
+    error_status(e).is_some_and(|s| s.is_client_error())
+}
+
+/// # Overview
+///
+/// Everything needed to reach one KCS instance.
+///
+/// Grouped into a struct because the constructor took six arguments, two
+/// of which — `base_url` and `token` — are both `&str` and adjacent.
+/// Transposing them compiles cleanly and then sends the URL as the
+/// credential, which fails with a confusing "login failed" rather than
+/// anything that points at the mistake. Named fields make that
+/// unexpressible.
+#[derive(Debug, Clone, Copy)]
+pub struct Connection<'a> {
+    /// Base URL including `/api`, without a version segment.
+    pub base_url: &'a str,
+    /// API token for the `Tron-Token` header.
+    pub token: &'a str,
+    /// Whether to verify the server's TLS certificate.
+    pub verify_tls: bool,
+    /// Optional `Host` header override, for reaching an ingress by IP.
+    pub host_header: Option<&'a str>,
+    /// Request deadlines.
+    pub timeouts: Timeouts,
+}
+
+/// What a single `healthz` probe told us.
+///
+/// Distinguishing these is what lets [`KcsClient::detect`] give a useful
+/// diagnosis: a missing route means "try the other generation", while a
+/// rejected token means "stop, the credential is wrong" — retrying the
+/// second generation with the same token would only waste a round trip
+/// and then report the wrong problem.
+enum Probe {
+    /// The instance reported its release.
+    Version(KcsVersion),
+    /// 404 — this generation is not served here.
+    Missing,
+    /// 401/403 — the route exists but the token was rejected.
+    Unauthorized(u16),
+    /// Anything else: transport failure, 5xx, or an unparseable body.
+    Failed(anyhow::Error),
+}
+
+/// # Overview
+///
+/// Authenticated HTTP client for a single KCS instance, pinned to one
+/// API generation.
 ///
 /// Cheap to `Clone` — internally wraps an [`reqwest::Client`], which
 /// is itself an `Arc` over a connection pool. Cloning the `KcsClient`
@@ -22,55 +146,286 @@ use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
 #[derive(Clone)]
 pub struct KcsClient {
     base: String,
+    api: ApiVersion,
     http: reqwest::Client,
+    /// When set, writes are described on stdout and never sent.
+    dry_run: bool,
+    /// Supplies the synthetic IDs a dry run hands back in place of the
+    /// server's. `Arc<AtomicU64>` rather than a plain counter because
+    /// `KcsClient` is shared behind `&self` and cloned to share the
+    /// connection pool, so the sequence has to be shared too -- a
+    /// per-clone counter would mint colliding IDs.
+    dry_run_seq: Arc<AtomicU64>,
+}
+
+/// Builds the underlying HTTP client: auth header, optional `Host`
+/// override, TLS policy and timeouts.
+///
+/// # Errors
+///
+/// Returns an error if `token` or `host_header` contain bytes that are
+/// not valid in an HTTP header, or if [`reqwest::Client`] fails to build.
+fn build_http(conn: &Connection<'_>) -> Result<reqwest::Client> {
+    let mut default_headers = HeaderMap::new();
+    default_headers.insert("Tron-Token", HeaderValue::from_str(conn.token)?);
+    if let Some(host) = conn.host_header {
+        default_headers.insert("Host", HeaderValue::from_str(host)?);
+    }
+
+    reqwest::Client::builder()
+        .danger_accept_invalid_certs(!conn.verify_tls)
+        .default_headers(default_headers)
+        .connect_timeout(conn.timeouts.connect)
+        .timeout(conn.timeouts.request)
+        .build()
+        .with_context(|| format!("failed to build HTTP client for {}", conn.base_url))
+}
+
+/// Sends one `GET {base}{prefix}/healthz` and classifies the result.
+///
+/// # Cancel safety
+///
+/// Cancel-safe. One read-only GET, no local state, nothing written.
+async fn probe_healthz(http: &reqwest::Client, base: &str, prefix: &str) -> Probe {
+    let resp = match http.get(format!("{base}{prefix}/healthz")).send().await {
+        Ok(r) => r,
+        Err(e) => return Probe::Failed(e.into()),
+    };
+
+    let status = resp.status();
+    if status == reqwest::StatusCode::NOT_FOUND {
+        return Probe::Missing;
+    }
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        return Probe::Unauthorized(status.as_u16());
+    }
+    if !status.is_success() {
+        return Probe::Failed(anyhow!(
+            "GET {prefix}/healthz returned HTTP {}",
+            status.as_u16()
+        ));
+    }
+
+    match resp.json::<serde_json::Value>().await {
+        Ok(body) => match version::from_healthz_body(&body) {
+            Ok(v) => Probe::Version(v),
+            Err(e) => Probe::Failed(e.into()),
+        },
+        Err(e) => Probe::Failed(e.into()),
+    }
+}
+
+/// Hand-written rather than derived: `KcsClient` holds the API token inside the
+/// wrapped [`reqwest::Client`]'s default headers, and a derived `Debug` would print
+/// whatever that type chooses to expose. Only the two fields that are safe to log
+/// appear here, so the token cannot reach a log line, a panic message or a test
+/// failure by accident.
+impl std::fmt::Debug for KcsClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KcsClient")
+            .field("base", &self.base)
+            .field("api", &self.api)
+            .field("token", &"<redacted>")
+            .field("dry_run", &self.dry_run)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Turns a non-2xx response into an error that carries the server's own
+/// message, and leaves a 2xx response untouched.
+///
+/// [`reqwest::Response::error_for_status`] alone produces
+/// `HTTP status client error (400 Bad Request) for url (...)` and discards
+/// the body — so an operator watching an import abort is told only the
+/// number. KCS puts the actual reason there, e.g.
+/// `MDW-415 "scopes are empty"  field: systemScopes`, which is the
+/// difference between a usable report and a guess.
+///
+/// The [`reqwest::Error`] is kept as the error's source, so the callers that
+/// branch on the status via [`error_status`] keep working.
+async fn with_body_context(resp: reqwest::Response) -> Result<reqwest::Response> {
+    let status = resp.status();
+    if !status.is_client_error() && !status.is_server_error() {
+        return Ok(resp);
+    }
+
+    let url = resp.url().to_string();
+    // The body has to be taken before `error_for_status`, which consumes the
+    // response; `error_for_status_ref` keeps it available.
+    let status_err = resp.error_for_status_ref().err();
+    let body = resp.text().await.unwrap_or_default();
+    let detail = body.trim();
+    let detail = if detail.is_empty() {
+        "<empty response body>".to_string()
+    } else {
+        // Long HTML error pages are not worth pasting in full.
+        detail.chars().take(400).collect()
+    };
+
+    let err = status_err.map_or_else(|| anyhow!("HTTP {status} for {url}"), anyhow::Error::new);
+    Err(err.context(format!("{} said: {detail}", status.as_u16())))
 }
 
 impl KcsClient {
     /// # Overview
     ///
-    /// Builds a client that targets `base_url` and presents `token`
-    /// in the `Tron-Token` header on every request. Pass
-    /// `verify_tls = false` to accept self-signed certificates; pass
-    /// `host_header = Some("kcs.internal")` to override the `Host`
-    /// header when the API is fronted by an ingress.
+    /// Builds a client that targets `base_url`, speaks the `api`
+    /// generation, and presents `token` in the `Tron-Token` header on
+    /// every request. Pass `verify_tls = false` to accept self-signed
+    /// certificates; pass `host_header = Some("kcs.internal")` to
+    /// override the `Host` header when the API is fronted by an ingress.
     ///
-    /// The trailing slash (if any) on `base_url` is stripped so callers
-    /// can pass paths starting with `/v1/...` without producing
-    /// `//v1/...` URLs.
+    /// The trailing slash (if any) on `base_url` is stripped, and the
+    /// version prefix is inserted by the client, so callers pass
+    /// version-relative paths like `"/policies/scanner"`.
     ///
     /// # Errors
     ///
     /// Returns an error if `token` or `host_header` contain bytes that
     /// are not valid in an HTTP header, or if [`reqwest::Client`] fails
     /// to build (e.g. an invalid TLS configuration on the host).
-    pub fn new(
-        base_url: &str,
-        token: &str,
-        verify_tls: bool,
-        host_header: Option<&str>,
-    ) -> Result<Self> {
-        let mut default_headers = HeaderMap::new();
-        default_headers.insert("Tron-Token", HeaderValue::from_str(token)?);
-        if let Some(host) = host_header {
-            default_headers.insert("Host", HeaderValue::from_str(host)?);
-        }
-
-        let http = reqwest::Client::builder()
-            .danger_accept_invalid_certs(!verify_tls)
-            .default_headers(default_headers)
-            .build()
-            .with_context(|| format!("failed to build HTTP client for {base_url}"))?;
-
+    pub fn new(conn: &Connection<'_>, api: ApiVersion) -> Result<Self> {
+        let http = build_http(conn)?;
         Ok(Self {
-            base: base_url.trim_end_matches('/').to_string(),
+            base: conn.base_url.trim_end_matches('/').to_string(),
+            api,
             http,
+            dry_run: false,
+            dry_run_seq: Arc::new(AtomicU64::new(0)),
         })
     }
 
     /// # Overview
     ///
-    /// Sends `GET base_url + path` and parses the response body as JSON.
-    /// `path` should start with `/` (e.g. `"/v1/policies/scanner"`).
+    /// Probes `base_url` for its KCS release and returns a client pinned
+    /// to the matching API generation, together with the release found.
+    ///
+    /// Tries `GET /v1/healthz` first, since every release serves it, and
+    /// falls through to `GET /v3/healthz` for a release that has dropped
+    /// `v1` (expected from KCS 2.6). A rejected token stops the probe
+    /// immediately rather than repeating it against the second
+    /// generation.
+    ///
+    /// # Cancel safety
+    ///
+    /// Cancel-safe. Two sequential read-only GETs; a drop leaves nothing
+    /// behind on either side.
+    ///
+    /// # Errors
+    ///
+    /// Returns an authentication error if the instance rejected the
+    /// token, the underlying transport error if the instance could not be
+    /// reached, or [`VersionError::Undetectable`] — whose message names
+    /// the `--api-version` override — if no generation reported a
+    /// version.
+    pub async fn detect(conn: &Connection<'_>) -> Result<(Self, KcsVersion)> {
+        let http = build_http(conn)?;
+        let base = conn.base_url.trim_end_matches('/').to_string();
+
+        for prefix in [ApiVersion::V1.prefix(), ApiVersion::V3.prefix()] {
+            match probe_healthz(&http, &base, prefix).await {
+                Probe::Version(found) => {
+                    let api = ApiVersion::for_kcs(found);
+                    return Ok((
+                        Self {
+                            base,
+                            api,
+                            http,
+                            dry_run: false,
+                            dry_run_seq: Arc::new(AtomicU64::new(0)),
+                        },
+                        found,
+                    ));
+                }
+                // This generation is not served here; fall out of the match and let
+                // the loop try the next prefix. (An explicit `continue` here is what
+                // `clippy::needless_continue` objects to, since it is the last thing
+                // the loop body would do anyway.)
+                Probe::Missing => (),
+                // The same token would be rejected by the next probe too.
+                Probe::Unauthorized(code) => {
+                    return Err(anyhow!(
+                        "KCS at {base} rejected the API token (HTTP {code}). Check \
+                         --token / KCS_TOKEN; the value is shown on the 'My profile' \
+                         page of the KCS web console."
+                    ))
+                }
+                // Transport or server failure — retrying the other generation
+                // against the same host would report the wrong cause.
+                Probe::Failed(e) => {
+                    return Err(e.context(format!(
+                        "failed to read the KCS version from {base}{prefix}/healthz"
+                    )))
+                }
+            }
+        }
+
+        Err(VersionError::Undetectable.into())
+    }
+
+    /// # Overview
+    ///
+    /// Returns this client with writes disabled.
+    ///
+    /// In dry-run mode [`Self::post`], [`Self::put_json`] and
+    /// [`Self::put_bytes`] describe what they would send on stdout and
+    /// return a synthetic response instead of sending anything. Reads
+    /// still go to the server, so the whole pipeline — including
+    /// foreign-key rewriting, which needs a created resource's ID — runs
+    /// end to end against real data.
+    ///
+    /// A builder method rather than another [`Self::new`] parameter: that
+    /// signature already takes six arguments, and dry-run is orthogonal
+    /// to how the connection is made.
+    #[must_use]
+    pub const fn with_dry_run(mut self, dry_run: bool) -> Self {
+        self.dry_run = dry_run;
+        self
+    }
+
+    /// # Overview
+    ///
+    /// Whether writes are suppressed.
+    #[must_use]
+    pub const fn is_dry_run(&self) -> bool {
+        self.dry_run
+    }
+
+    /// Reports a suppressed write and mints the synthetic ID that stands in
+    /// for the one the server would have assigned.
+    fn describe_suppressed_write(&self, verb: &str, path: &str, body_len: usize) -> String {
+        let seq = self.dry_run_seq.fetch_add(1, Ordering::Relaxed);
+        let id = format!("dry-run-{seq:04}");
+        println!(
+            "DRY RUN  {verb:4} {}  ({body_len} bytes)  -> id {id}",
+            self.url(path)
+        );
+        id
+    }
+
+    /// # Overview
+    ///
+    /// Which API generation this client speaks.
+    #[must_use]
+    pub const fn api_version(&self) -> ApiVersion {
+        self.api
+    }
+
+    /// Builds an absolute URL from a version-relative path:
+    /// `"/policies/scanner"` → `"{base}/v3/policies/scanner"`.
+    fn url(&self, rel: &str) -> String {
+        format!("{}{}{}", self.base, self.api.prefix(), rel)
+    }
+
+    /// # Overview
+    ///
+    /// Sends `GET` to the version-relative `path` and parses the
+    /// response body as JSON. `path` should start with `/` and omit the
+    /// version segment (e.g. `"/policies/scanner"`).
+    ///
+    /// # Cancel safety
+    ///
+    /// Cancel-safe. Read-only, no local state across the `.await`.
     ///
     /// # Errors
     ///
@@ -81,38 +436,45 @@ impl KcsClient {
     pub async fn get(&self, path: &str) -> Result<serde_json::Value> {
         let resp = self
             .http
-            .get(format!("{}{}", self.base, path))
+            .get(self.url(path))
             .header(CONTENT_TYPE, "application/json")
             .send()
-            .await?
-            .error_for_status()?;
+            .await?;
+        let resp = with_body_context(resp).await?;
         Ok(resp.json().await?)
     }
 
     /// # Overview
     ///
-    /// Sends `GET base_url + path` and returns the raw response body.
-    /// Used for the network-reputation binary export, which is opaque
-    /// blob data rather than JSON.
+    /// Sends `GET` to the version-relative `path` and returns the raw
+    /// response body. Used for the network-reputation binary export,
+    /// which is opaque blob data rather than JSON.
+    ///
+    /// # Cancel safety
+    ///
+    /// Cancel-safe. Read-only; a drop discards a partially-downloaded
+    /// body without surfacing it.
     ///
     /// # Errors
     ///
     /// Returns the transport error, or an HTTP status error for any
     /// non-2xx response.
     pub async fn get_bytes(&self, path: &str) -> Result<Vec<u8>> {
-        let resp = self
-            .http
-            .get(format!("{}{}", self.base, path))
-            .send()
-            .await?
-            .error_for_status()?;
+        let resp = self.http.get(self.url(path)).send().await?;
+        let resp = with_body_context(resp).await?;
         Ok(resp.bytes().await?.to_vec())
     }
 
     /// # Overview
     ///
-    /// Sends `POST base_url + path` with `body` serialized as JSON and
-    /// parses the response body as JSON.
+    /// Sends `POST` to the version-relative `path` with `body`
+    /// serialized as JSON and parses the response body as JSON.
+    ///
+    /// # Cancel safety
+    ///
+    /// Cancel-safe for this process, but **not idempotent**: a dropped
+    /// future may already have been applied by the server. See the
+    /// module docs.
     ///
     /// # Errors
     ///
@@ -123,23 +485,33 @@ impl KcsClient {
     /// [`reqwest::Error`]) to distinguish 400-graceful-skip from a hard
     /// failure.
     pub async fn post(&self, path: &str, body: &serde_json::Value) -> Result<serde_json::Value> {
+        if self.dry_run {
+            let len = serde_json::to_vec(body).map_or(0, |v| v.len());
+            let id = self.describe_suppressed_write("POST", path, len);
+            return Ok(serde_json::json!({ "id": id }));
+        }
         let resp = self
             .http
-            .post(format!("{}{}", self.base, path))
+            .post(self.url(path))
             .header(CONTENT_TYPE, "application/json")
             .json(body)
             .send()
-            .await?
-            .error_for_status()?;
+            .await?;
+        let resp = with_body_context(resp).await?;
         Ok(resp.json().await?)
     }
 
     /// # Overview
     ///
-    /// Sends `PUT base_url + path` with `body` serialized as JSON.
-    /// Returns the parsed response body, or an empty JSON object when
-    /// the server replies 2xx with no body (KCS does this for some
-    /// idempotent update endpoints).
+    /// Sends `PUT` to the version-relative `path` with `body` serialized
+    /// as JSON. Returns the parsed response body, or an empty JSON
+    /// object when the server replies 2xx with no body (KCS does this
+    /// for some idempotent update endpoints).
+    ///
+    /// # Cancel safety
+    ///
+    /// Cancel-safe for this process, but **not idempotent**. See the
+    /// module docs.
     ///
     /// # Errors
     ///
@@ -151,17 +523,22 @@ impl KcsClient {
         path: &str,
         body: &serde_json::Value,
     ) -> Result<serde_json::Value> {
+        if self.dry_run {
+            let len = serde_json::to_vec(body).map_or(0, |v| v.len());
+            self.describe_suppressed_write("PUT", path, len);
+            return Ok(serde_json::Value::Object(serde_json::Map::default()));
+        }
         let resp = self
             .http
-            .put(format!("{}{}", self.base, path))
+            .put(self.url(path))
             .header(CONTENT_TYPE, "application/json")
             .json(body)
             .send()
-            .await?
-            .error_for_status()?;
+            .await?;
+        let resp = with_body_context(resp).await?;
         let bytes = resp.bytes().await?;
         if bytes.is_empty() {
-            Ok(serde_json::Value::Object(Default::default()))
+            Ok(serde_json::Value::Object(serde_json::Map::default()))
         } else {
             Ok(serde_json::from_slice(&bytes)?)
         }
@@ -169,31 +546,108 @@ impl KcsClient {
 
     /// # Overview
     ///
+    /// Sends `PUT` to the version-relative `path` with `data` as a single
+    /// `multipart/form-data` file part named `field`.
+    ///
+    /// Used for the custom-reputation list upload. That endpoint rejects
+    /// `application/octet-stream` with
+    /// `request Content-Type isn't multipart/form-data`, even though the
+    /// published v3 `OpenAPI` document declares octet-stream for it — one
+    /// more place where the document and the server disagree and the
+    /// server wins. The part name `file` was established against the live
+    /// instance; `list`, `data` and `reputation` all return
+    /// `http: no such file`.
+    ///
+    /// # Cancel safety
+    ///
+    /// Cancel-safe for this process, but **not idempotent**. See the
+    /// module docs.
+    ///
+    /// # Errors
+    ///
+    /// Returns the transport error, or an HTTP status error carrying the
+    /// server's message for any non-2xx response.
+    pub async fn put_multipart_file(
+        &self,
+        path: &str,
+        field: &str,
+        filename: &str,
+        data: Vec<u8>,
+    ) -> Result<()> {
+        if self.dry_run {
+            self.describe_suppressed_write("PUT", path, data.len());
+            return Ok(());
+        }
+        let part = reqwest::multipart::Part::bytes(data).file_name(filename.to_string());
+        let form = reqwest::multipart::Form::new().part(field.to_string(), part);
+        let resp = self.http.put(self.url(path)).multipart(form).send().await?;
+        with_body_context(resp).await?;
+        Ok(())
+    }
+
+    /// # Overview
+    ///
     /// Returns the base URL the client was constructed with, with any
-    /// trailing slash stripped. Used by [`crate::export::export_all`]
-    /// to record the source URL in the bundle manifest.
+    /// trailing slash stripped and without the version segment. Used by
+    /// [`crate::export::export_all`] to record the source URL in the
+    /// bundle manifest.
+    ///
+    /// # Lifetimes
+    ///
+    /// Returns `&'s str` borrowed from `&'s self`. Unlike
+    /// [`crate::id_mapper::IdMapper::resolve`] this is rarely a
+    /// constraint in practice, because a `KcsClient` normally outlives
+    /// every use of its URL — but the borrow is still real:
+    ///
+    /// ```
+    /// use kcs_migrator::client::{Connection, KcsClient, Timeouts};
+    /// use kcs_migrator::version::ApiVersion;
+    ///
+    /// let conn = Connection {
+    ///     base_url: "https://kcs.demo.lab/api/",
+    ///     token: "tok",
+    ///     verify_tls: true,
+    ///     host_header: None,
+    ///     timeouts: Timeouts::default(),
+    /// };
+    /// let client = KcsClient::new(&conn, ApiVersion::V3).unwrap();
+    ///
+    /// // Borrowed, trailing slash stripped, no version segment.
+    /// assert_eq!(client.base_url(), "https://kcs.demo.lab/api");
+    /// ```
+    #[must_use]
     pub fn base_url(&self) -> &str {
         &self.base
     }
 
     /// # Overview
     ///
-    /// Sends `PUT base_url + path` with `data` as an
+    /// Sends `PUT` to the version-relative `path` with `data` as an
     /// `application/octet-stream` body. Used for the network-reputation
     /// binary upload during import.
+    ///
+    /// # Cancel safety
+    ///
+    /// Cancel-safe for this process, but **not idempotent**. See the
+    /// module docs.
     ///
     /// # Errors
     ///
     /// Returns the transport error, or an HTTP status error for any
     /// non-2xx response.
     pub async fn put_bytes(&self, path: &str, data: Vec<u8>) -> Result<()> {
-        self.http
-            .put(format!("{}{}", self.base, path))
+        if self.dry_run {
+            self.describe_suppressed_write("PUT", path, data.len());
+            return Ok(());
+        }
+        let resp = self
+            .http
+            .put(self.url(path))
             .header(CONTENT_TYPE, "application/octet-stream")
             .body(data)
             .send()
-            .await?
-            .error_for_status()?;
+            .await?;
+        with_body_context(resp).await?;
         Ok(())
     }
 }
@@ -201,9 +655,45 @@ impl KcsClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+    use serde_json::{json, Value};
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// A V1 client with default timeouts, for the transport tests.
+    fn v1_client(uri: &str, token: &str) -> Result<KcsClient> {
+        client_with(uri, token, ApiVersion::V1, None, Timeouts::default())
+    }
+
+    /// A client with every knob spelled out, for the tests that vary one.
+    fn client_with(
+        uri: &str,
+        token: &str,
+        api: ApiVersion,
+        host_header: Option<&str>,
+        timeouts: Timeouts,
+    ) -> Result<KcsClient> {
+        KcsClient::new(
+            &Connection {
+                base_url: uri,
+                token,
+                verify_tls: true,
+                host_header,
+                timeouts,
+            },
+            api,
+        )
+    }
+
+    /// A `Connection` for the detection tests.
+    fn conn(uri: &str) -> Connection<'_> {
+        Connection {
+            base_url: uri,
+            token: "tok",
+            verify_tls: true,
+            host_header: None,
+            timeouts: Timeouts::default(),
+        }
+    }
 
     #[tokio::test]
     async fn client_injects_auth_header() -> Result<()> {
@@ -215,8 +705,8 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = KcsClient::new(&server.uri(), "test-token", true, None)?;
-        let resp = client.get("/v1/healthz").await?;
+        let client = v1_client(&server.uri(), "test-token")?;
+        let resp = client.get("/healthz").await?;
         assert_eq!(resp["status"], "ok");
         Ok(())
     }
@@ -231,9 +721,9 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = KcsClient::new(&server.uri(), "tok", true, None)?;
+        let client = v1_client(&server.uri(), "tok")?;
         let resp = client
-            .post("/v1/policies/scanner", &json!({"name": "test-pol"}))
+            .post("/policies/scanner", &json!({"name": "test-pol"}))
             .await?;
         assert_eq!(resp["id"], "new-id");
         Ok(())
@@ -248,9 +738,9 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = KcsClient::new(&server.uri(), "tok", true, None)?;
+        let client = v1_client(&server.uri(), "tok")?;
         let resp = client
-            .put_json("/v1/integrations/ldap", &json!({"name": "corp"}))
+            .put_json("/integrations/ldap", &json!({"name": "corp"}))
             .await?;
         assert_eq!(resp["id"], "ldap-1");
         Ok(())
@@ -266,12 +756,9 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = KcsClient::new(&server.uri(), "tok", true, None)?;
+        let client = v1_client(&server.uri(), "tok")?;
         client
-            .put_bytes(
-                "/v1/policies/custom-reputation/import",
-                b"raw-data".to_vec(),
-            )
+            .put_bytes("/policies/custom-reputation/import", b"raw-data".to_vec())
             .await?;
         Ok(())
     }
@@ -285,11 +772,382 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = KcsClient::new(&server.uri(), "tok", true, None)?;
+        let client = v1_client(&server.uri(), "tok")?;
         let data = client
-            .get_bytes("/v1/policies/custom-reputation/export")
+            .get_bytes("/policies/custom-reputation/export")
             .await?;
         assert_eq!(&data[..], b"raw-export-data");
         Ok(())
+    }
+
+    // ---- §7.3 path prefixing ----
+
+    #[tokio::test]
+    async fn v3_client_prefixes_paths_with_v3() -> Result<()> {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v3/policies/scanner"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"items": []})))
+            .mount(&server)
+            .await;
+
+        let client = client_with(
+            &server.uri(),
+            "tok",
+            ApiVersion::V3,
+            None,
+            Timeouts::default(),
+        )?;
+        // The same relative path the V1 test uses — only the client differs.
+        client.get("/policies/scanner").await?;
+        assert_eq!(client.api_version(), ApiVersion::V3);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn v1_client_prefixes_paths_with_v1() -> Result<()> {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/policies/scanner"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"items": []})))
+            .mount(&server)
+            .await;
+
+        let client = v1_client(&server.uri(), "tok")?;
+        client.get("/policies/scanner").await?;
+        assert_eq!(client.api_version(), ApiVersion::V1);
+        Ok(())
+    }
+
+    #[test]
+    fn base_url_keeps_no_version_segment_and_no_trailing_slash() -> Result<()> {
+        let client = client_with(
+            "https://kcs.demo.lab/api/",
+            "tok",
+            ApiVersion::V3,
+            None,
+            Timeouts::default(),
+        )?;
+        assert_eq!(client.base_url(), "https://kcs.demo.lab/api");
+        assert_eq!(
+            client.url("/policies/scanner"),
+            "https://kcs.demo.lab/api/v3/policies/scanner"
+        );
+        Ok(())
+    }
+
+    // ---- §7.2 version detection over the wire ----
+
+    /// Mounts `GET {prefix}/healthz` with a given status and optional body.
+    async fn mount_healthz(server: &MockServer, prefix: &str, status: u16, body: Option<Value>) {
+        let template = body.map_or_else(
+            || ResponseTemplate::new(status),
+            |b| ResponseTemplate::new(status).set_body_json(b),
+        );
+        Mock::given(method("GET"))
+            .and(path(format!("{prefix}/healthz")))
+            .respond_with(template)
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn detect_picks_v3_for_a_2_5_instance() -> Result<()> {
+        let server = MockServer::start().await;
+        mount_healthz(&server, "/v1", 200, Some(json!({"version": "2.5.0"}))).await;
+
+        let (client, found) = KcsClient::detect(&conn(&server.uri())).await?;
+        assert_eq!(found, KcsVersion::new(2, 5, 0));
+        assert_eq!(client.api_version(), ApiVersion::V3);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn detect_picks_v1_for_a_2_4_instance() -> Result<()> {
+        let server = MockServer::start().await;
+        mount_healthz(&server, "/v1", 200, Some(json!({"version": "2.4.1"}))).await;
+
+        let (client, found) = KcsClient::detect(&conn(&server.uri())).await?;
+        assert_eq!(found, KcsVersion::new(2, 4, 1));
+        assert_eq!(client.api_version(), ApiVersion::V1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn detect_falls_through_to_v3_when_v1_is_gone() -> Result<()> {
+        // The shape expected from KCS 2.6, which deprecates v1.
+        let server = MockServer::start().await;
+        mount_healthz(&server, "/v1", 404, None).await;
+        mount_healthz(&server, "/v3", 200, Some(json!({"version": "2.6.0"}))).await;
+
+        let (client, found) = KcsClient::detect(&conn(&server.uri())).await?;
+        assert_eq!(found, KcsVersion::new(2, 6, 0));
+        assert_eq!(client.api_version(), ApiVersion::V3);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn detect_reports_undetectable_naming_the_override_flag() {
+        let server = MockServer::start().await;
+        mount_healthz(&server, "/v1", 404, None).await;
+        mount_healthz(&server, "/v3", 404, None).await;
+
+        let err = KcsClient::detect(&conn(&server.uri()))
+            .await
+            .expect_err("both probes 404, detection must fail");
+        let rendered = format!("{err}");
+        assert!(
+            rendered.contains("--api-version"),
+            "operator needs the override flag named, got: {rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn detect_stops_on_a_rejected_token_without_probing_v3() -> Result<()> {
+        // Only /v1/healthz is mounted. If detect were to fall through to /v3 on a
+        // 403, wiremock would record an unmatched request — and the diagnosis the
+        // operator sees would be "undetectable version" instead of "bad token".
+        let server = MockServer::start().await;
+        mount_healthz(
+            &server,
+            "/v1",
+            403,
+            Some(json!({"code": "MDD-001", "message": "login failed"})),
+        )
+        .await;
+
+        let err = KcsClient::detect(&conn(&server.uri()))
+            .await
+            .expect_err("a rejected token must fail detection");
+        let rendered = format!("{err}");
+        assert!(
+            rendered.contains("token"),
+            "error should point at the token, got: {rendered}"
+        );
+
+        let healthz_requests = server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|r| r.url.path().ends_with("/healthz"))
+            .count();
+        assert_eq!(healthz_requests, 1, "must not retry v3 with the same token");
+        Ok(())
+    }
+
+    // ---- §7.4 timeouts ----
+
+    #[test]
+    fn default_timeouts_are_10s_connect_120s_request() {
+        let t = Timeouts::default();
+        assert_eq!(t.connect, Duration::from_secs(10));
+        assert_eq!(t.request, Duration::from_secs(120));
+    }
+
+    #[tokio::test]
+    async fn request_timeout_fires_on_a_server_that_never_responds() -> Result<()> {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/policies/scanner"))
+            // Far longer than the client's budget, so the deadline is what ends the call.
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"items": []}))
+                    .set_delay(Duration::from_secs(30)),
+            )
+            .mount(&server)
+            .await;
+
+        let client = client_with(
+            &server.uri(),
+            "tok",
+            ApiVersion::V1,
+            None,
+            Timeouts {
+                connect: Duration::from_millis(500),
+                request: Duration::from_millis(150),
+            },
+        )?;
+
+        let err = client
+            .get("/policies/scanner")
+            .await
+            .expect_err("a 30s response against a 150ms budget must time out");
+        let as_reqwest = err
+            .downcast_ref::<reqwest::Error>()
+            .ok_or_else(|| anyhow!("expected a reqwest error, got: {err}"))?;
+        assert!(
+            as_reqwest.is_timeout(),
+            "expected a timeout, got: {as_reqwest}"
+        );
+        Ok(())
+    }
+
+    // ---- host header override ----
+
+    #[tokio::test]
+    async fn host_header_override_actually_reaches_the_server() -> Result<()> {
+        // The README documents --host-header for reaching KCS by ingress IP, and
+        // it is implemented by putting Host into reqwest's default_headers. Whether
+        // hyper overwrites that from the URL authority was never verified, so the
+        // feature was documented but unproven. This pins it.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/healthz"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"status": "ok"})))
+            .mount(&server)
+            .await;
+
+        let client = client_with(
+            &server.uri(),
+            "tok",
+            ApiVersion::V1,
+            Some("kcs.demo.lab"),
+            Timeouts::default(),
+        )?;
+        client.get("/healthz").await?;
+
+        let seen = server.received_requests().await.unwrap_or_default();
+        let host = seen
+            .first()
+            .and_then(|r| r.headers.get("host"))
+            .map(|v| String::from_utf8_lossy(v.as_bytes()).to_string());
+        assert_eq!(
+            host.as_deref(),
+            Some("kcs.demo.lab"),
+            "the Host override must survive to the wire, not be replaced by the URL \
+             authority; got {host:?}"
+        );
+        Ok(())
+    }
+
+    // ---- §7.6 dry run ----
+
+    #[tokio::test]
+    async fn dry_run_suppresses_writes_but_still_reads() -> Result<()> {
+        let server = MockServer::start().await;
+        // Reads succeed. Writes are mounted to fail loudly: if dry-run let one
+        // through, the 500 would surface as an error instead of a silent pass.
+        Mock::given(method("GET"))
+            .and(path("/v1/policies/scanner"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"items": []})))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let client = v1_client(&server.uri(), "tok")?.with_dry_run(true);
+        assert!(client.is_dry_run());
+
+        client.get("/policies/scanner").await?;
+        client
+            .post("/policies/scanner", &json!({"name": "p"}))
+            .await?;
+        client
+            .put_json("/integrations/ldap", &json!({"n": 1}))
+            .await?;
+        client
+            .put_bytes("/policies/custom-reputation/import", b"blob".to_vec())
+            .await?;
+
+        let seen = server.received_requests().await.unwrap_or_default();
+        let non_get: Vec<_> = seen
+            .iter()
+            .filter(|r| r.method != wiremock::http::Method::GET)
+            .map(|r| format!("{} {}", r.method, r.url.path()))
+            .collect();
+        assert!(
+            non_get.is_empty(),
+            "dry run must send no writes, sent: {non_get:?}"
+        );
+        assert_eq!(seen.len(), 1, "the read should still have gone out");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dry_run_mints_distinct_ids_so_fk_rewriting_still_works() -> Result<()> {
+        // The importer registers a created resource's id and rewrites later
+        // references to it. A dry run that returned the same id twice, or none,
+        // would collapse those mappings and hide real FK bugs.
+        let server = MockServer::start().await;
+        let client = v1_client(&server.uri(), "tok")?.with_dry_run(true);
+
+        let first = client.post("/policies/runtime-profile", &json!({})).await?;
+        let second = client.post("/policies/runtime-profile", &json!({})).await?;
+
+        let id_of = |v: &Value| v["id"].as_str().unwrap_or_default().to_string();
+        assert!(!id_of(&first).is_empty());
+        assert_ne!(id_of(&first), id_of(&second));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dry_run_sequence_is_shared_across_clones() -> Result<()> {
+        // KcsClient is cloned to share the connection pool. A per-clone counter
+        // would mint colliding synthetic ids across those clones.
+        let server = MockServer::start().await;
+        let client = v1_client(&server.uri(), "tok")?.with_dry_run(true);
+        let clone = client.clone();
+
+        let a = client.post("/policies/scanner", &json!({})).await?;
+        let b = clone.post("/policies/scanner", &json!({})).await?;
+        assert_ne!(a["id"], b["id"]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn writes_are_sent_when_dry_run_is_off() -> Result<()> {
+        // The twin of the suppression test: proves with_dry_run(false) is not
+        // silently suppressing everything.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/policies/scanner"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({"id": "real"})))
+            .mount(&server)
+            .await;
+
+        let client = v1_client(&server.uri(), "tok")?.with_dry_run(false);
+        let out = client.post("/policies/scanner", &json!({})).await?;
+        assert_eq!(out["id"], "real");
+        assert_eq!(
+            server.received_requests().await.unwrap_or_default().len(),
+            1
+        );
+        Ok(())
+    }
+
+    // ---- §7.3 the version lives in one place ----
+
+    /// Returns the portion of a module's source before its `#[cfg(test)]` block.
+    ///
+    /// Test code legitimately names `/v1/...` and `/v3/...` in wiremock matchers —
+    /// those are the URLs we assert the client builds. Only shipped code has to be
+    /// free of them.
+    fn production_source(src: &str) -> &str {
+        src.split("#[cfg(test)]").next().unwrap_or(src)
+    }
+
+    #[test]
+    fn no_versioned_path_literals_remain_in_shipped_code() {
+        for (name, src) in [
+            ("export.rs", include_str!("export.rs")),
+            ("importer.rs", include_str!("importer.rs")),
+        ] {
+            let prod = production_source(src);
+            for needle in ["\"/v1/", "\"/v3/"] {
+                assert!(
+                    !prod.contains(needle),
+                    "{name} still contains the literal {needle}… — the API generation \
+                     belongs to KcsClient, not to call sites"
+                );
+            }
+        }
     }
 }

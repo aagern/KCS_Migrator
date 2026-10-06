@@ -1,0 +1,37 @@
+{
+  "id": "66666666-6666-4666-8666-666666666666",
+  "name": "example-runtime",
+  "type": "container",
+  "description": "A v1 runtime policy carrying admission controls inline.",
+  "enabled": true,
+  "enforcementMode": "audit",
+  "containerLifecycleEnabled": false,
+  "containerLifecycleOperationTypes": ["create", "start", "stop", "delete"],
+  "useBypassCriteria": true,
+  "bypassCriteria": ["image.registry.registry.example.invalid"],
+  "useBestPracticeCheck": false,
+  "bestPracticeCheck": [],
+  "useBlockNonCompliantImages": true,
+  "useBlockUnregisteredImages": false,
+  "useCapabilityBlock": true,
+  "capabilityBlock": ["CAP_SYS_ADMIN"],
+  "useLimitContainerPrivileges": false,
+  "limitContainerPrivileges": [],
+  "useRegistriesAllowed": false,
+  "registriesAllowed": [],
+  "useVolumesBlocked": false,
+  "volumesBlocked": [],
+  "useImageContentTrust": false,
+  "signCheckPolicies": [],
+  "useContainerRuntimeProfiles": true,
+  "runtimeProfileMatchBlocks": [
+    {
+      "type": "label",
+      "podLabels": { "app": "example" },
+      "imageDigests": [],
+      "profileNames": ["example-profile"]
+    }
+  ],
+  "systemScopes": ["44444444-4444-4444-8444-444444444444"],
+  "useAutoProfiles": false
+}

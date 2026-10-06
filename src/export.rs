@@ -7,16 +7,33 @@
 //!
 //! # Why the per-item GETs
 //!
-//! KCS `GET /v1/<resource>` (list) returns a truncated projection of
+//! KCS `GET /<resource>` (list) returns a truncated projection of
 //! each item — often missing fields the `POST` endpoint requires
 //! (e.g. `scanTimeout` on image registries, `agentType` on agent
 //! groups). For resource classes that get re-`POST`ed during import,
-//! [`get_list_detailed`] composes the list response with per-item
-//! `GET /v1/<resource>/<id>` calls so the bundle records the full
+//! `get_list_detailed` composes the list response with per-item
+//! `GET /<resource>/<id>` calls so the bundle records the full
 //! POST-ready schema. List-only resources (reference dumps) can use
-//! [`get_list`] directly.
+//! `get_list` directly.
 
-use crate::client::KcsClient;
+//! # Cancel safety
+//!
+//! Every `async fn` here is cancel-safe. Each section writes whole files
+//! with [`std::fs::write`], so dropping the future at an `.await` leaves
+//! the files written so far and nothing half-written: the only filesystem
+//! mutation is the write of a complete buffer.
+//!
+//! What a cancel does leave behind is an **incomplete bundle directory**.
+//! That is made detectable rather than merely survivable:
+//! [`export_all`] writes `manifest.json` last, so its absence marks the
+//! bundle as unfinished, and [`crate::importer::import_bundle`] refuses
+//! such a directory before contacting the target. The ordering is
+//! load-bearing — a test pins it.
+
+use crate::bundle::Manifest;
+use crate::cel;
+use crate::client::{is_client_error, KcsClient};
+use crate::version::KcsVersion;
 use anyhow::{anyhow, Result};
 use chrono::Utc;
 use serde_json::{json, Value};
@@ -73,13 +90,8 @@ async fn get_list(client: &KcsClient, api_path: &str) -> Result<Value> {
             }
         }
         Err(e) => {
-            if let Some(status) = e
-                .downcast_ref::<reqwest::Error>()
-                .and_then(|re| re.status())
-            {
-                if status.as_u16() == 400 || status.as_u16() == 404 {
-                    return Ok(json!([]));
-                }
+            if is_client_error(&e) {
+                return Ok(json!([]));
             }
             Err(e)
         }
@@ -101,13 +113,8 @@ async fn get_single(client: &KcsClient, api_path: &str) -> Result<Value> {
         Ok(data) if data.is_object() => Ok(data),
         Ok(_) => Ok(json!({})),
         Err(e) => {
-            if let Some(status) = e
-                .downcast_ref::<reqwest::Error>()
-                .and_then(|re| re.status())
-            {
-                if status.as_u16() == 400 || status.as_u16() == 404 {
-                    return Ok(json!({}));
-                }
+            if is_client_error(&e) {
+                return Ok(json!({}));
             }
             Err(e)
         }
@@ -138,8 +145,8 @@ async fn get_single(client: &KcsClient, api_path: &str) -> Result<Value> {
 /// ```ignore
 /// let registries = get_list_detailed(
 ///     &client,
-///     "/v1/integrations/image-registries",
-///     "/v1/integrations/image-registries",
+///     "/integrations/image-registries",
+///     "/integrations/image-registries",
 /// ).await?;
 /// ```
 async fn get_list_detailed(
@@ -165,18 +172,8 @@ async fn get_list_detailed(
         match client.get(&format!("{item_path_prefix}/{id}")).await {
             Ok(full) if full.is_object() => detailed.push(full),
             Ok(_) => detailed.push(item),
-            Err(e) => {
-                let is_4xx = e
-                    .downcast_ref::<reqwest::Error>()
-                    .and_then(|re| re.status())
-                    .map(|s| s.is_client_error())
-                    .unwrap_or(false);
-                if is_4xx {
-                    detailed.push(item);
-                } else {
-                    return Err(e);
-                }
-            }
+            Err(e) if is_client_error(&e) => detailed.push(item),
+            Err(e) => return Err(e),
         }
     }
     Ok(Value::Array(detailed))
@@ -194,6 +191,12 @@ async fn get_list_detailed(
 /// URL. Files named `*-REFERENCE.json` are informational only — the
 /// importer will not attempt to replay them.
 ///
+/// # Cancel safety
+///
+/// Cancel-safe. Dropping this future leaves the bundle files written so
+/// far, with no `manifest.json` — which is exactly how an interrupted
+/// export is recognised. Re-run the export; do not import the directory.
+///
 /// # Errors
 ///
 /// Returns the first error encountered while talking to the source
@@ -203,17 +206,29 @@ async fn get_list_detailed(
 /// # Examples
 ///
 /// ```no_run
-/// use kcs_migrator::client::KcsClient;
+/// use kcs_migrator::client::{Connection, KcsClient, Timeouts};
 /// use kcs_migrator::export;
 /// use std::path::Path;
 ///
 /// # async fn run() -> anyhow::Result<()> {
-/// let client = KcsClient::new("https://kcs.src.corp", "tok", true, None)?;
-/// let bundle = export::export_all(&client, Path::new(".")).await?;
+/// let (client, kcs) = KcsClient::detect(&Connection {
+///     base_url: "https://kcs.src.corp",
+///     token: "tok",
+///     verify_tls: true,
+///     host_header: None,
+///     timeouts: Timeouts::default(),
+/// })
+/// .await?;
+/// println!("source is KCS {kcs}, speaking {:?}", client.api_version());
+/// let bundle = export::export_all(&client, Path::new("."), Some(kcs)).await?;
 /// println!("bundle: {}", bundle.display());
 /// # Ok(()) }
 /// ```
-pub async fn export_all(client: &KcsClient, output_dir: &Path) -> Result<PathBuf> {
+pub async fn export_all(
+    client: &KcsClient,
+    output_dir: &Path,
+    kcs_version: Option<KcsVersion>,
+) -> Result<PathBuf> {
     let ts = Utc::now().format("%Y-%m-%d_%H-%M-%S").to_string();
     let bundle = output_dir.join(format!("kcs-export-{ts}"));
 
@@ -221,11 +236,53 @@ pub async fn export_all(client: &KcsClient, output_dir: &Path) -> Result<PathBuf
     export_notifications_reference(client, &bundle).await?;
     export_policies(client, &bundle).await?;
     export_network_reputation(client, &bundle).await?;
+    export_siem_and_external_groups(client, &bundle).await?;
+    export_benchmark(client, &bundle).await?;
+    export_assurance_controls(client, &bundle).await?;
+    export_admission_controller(client, &bundle).await?;
+    export_custom_reputation(client, &bundle).await?;
     export_components(client, &bundle).await?;
     export_config(client, &bundle).await?;
-    write_manifest(&bundle, &ts, client.base_url())?;
+    export_security_scopes(client, &bundle).await?;
+    // Written last, deliberately: the absence of `manifest.json` is what marks a
+    // bundle directory as incomplete, and the importer refuses such a directory
+    // before writing anything to the target.
+    write_manifest(&bundle, &ts, client.base_url(), kcs_version, client)?;
 
     Ok(bundle)
+}
+
+/// Fields a bundle must never carry, keyed by the resource they appear on.
+///
+/// `deploymentToken` is a live credential: it enrols a node-agent into the
+/// instance that issued it. The KCS API returns it in full from
+/// `GET /integrations/agent-group/<id>` — unlike `bindPassword` or
+/// `clientSecret`, which come back masked as `***` — so without this step
+/// every bundle on disk is a credential-bearing artifact.
+///
+/// Removing it costs nothing: [`crate::importer`] already discards the
+/// field before `POSTing`, because the target mints its own token. What is
+/// kept is the agent manifest data an import actually needs.
+const REDACT_FROM_AGENT_GROUP: &[&str] = &["deploymentToken"];
+
+/// Strips [`REDACT_FROM_AGENT_GROUP`] from every entry of an agent-group
+/// list, returning how many values were removed.
+fn redact_agent_groups(groups: &mut Value) -> usize {
+    let Some(items) = groups.as_array_mut() else {
+        return 0;
+    };
+    let mut removed = 0;
+    for group in items.iter_mut() {
+        let Some(obj) = group.as_object_mut() else {
+            continue;
+        };
+        for field in REDACT_FROM_AGENT_GROUP {
+            if obj.remove(*field).is_some() {
+                removed += 1;
+            }
+        }
+    }
+    removed
 }
 
 /// # Overview
@@ -245,8 +302,8 @@ pub async fn export_all(client: &KcsClient, output_dir: &Path) -> Result<PathBuf
 async fn export_integrations(client: &KcsClient, bundle: &Path) -> Result<()> {
     let registries = get_list_detailed(
         client,
-        "/v1/integrations/image-registries",
-        "/v1/integrations/image-registries",
+        "/integrations/image-registries",
+        "/integrations/image-registries",
     )
     .await?;
     write_json(
@@ -254,27 +311,39 @@ async fn export_integrations(client: &KcsClient, bundle: &Path) -> Result<()> {
         &registries,
     )?;
 
-    let ldap = get_list(client, "/v1/integrations/ldap").await?;
+    let ldap = get_list(client, "/integrations/ldap").await?;
     write_json(&bundle.join("integrations/ldap.json"), &ldap)?;
 
-    let sso = get_single(client, "/v1/integrations/sso").await?;
+    let sso = get_single(client, "/integrations/sso").await?;
     write_json(&bundle.join("integrations/sso.json"), &sso)?;
 
-    let llm = get_single(client, "/v1/integrations/llm").await?;
-    write_json(&bundle.join("integrations/llm.json"), &llm)?;
+    // Reference-only: the create endpoint takes a multipart upload and what GET
+    // returns is connection status, not configuration. Kept in the bundle so an
+    // operator can see which provider was connected, under the -REFERENCE name
+    // that marks every file the importer will not replay.
+    let llm = get_single(client, "/integrations/llm").await?;
+    write_json(&bundle.join("integrations/llm-REFERENCE.json"), &llm)?;
 
-    let agent_groups = get_list_detailed(
+    let mut agent_groups = get_list_detailed(
         client,
-        "/v1/integrations/agent-group",
-        "/v1/integrations/agent-group",
+        "/integrations/agent-group",
+        "/integrations/agent-group",
     )
     .await?;
+    let redacted = redact_agent_groups(&mut agent_groups);
+    if redacted > 0 {
+        eprintln!(
+            "Note: removed {redacted} deployment token(s) from the agent-group export. \
+             They are server-issued credentials and cannot be replayed; the target mints \
+             its own when each agent group is created."
+        );
+    }
     write_json(
         &bundle.join("integrations/agent-groups.json"),
         &agent_groups,
     )?;
 
-    let sign_validators = get_list(client, "/v1/integrations/sign-validators").await?;
+    let sign_validators = get_list(client, "/integrations/sign-validators").await?;
     write_json(
         &bundle.join("integrations/sign-validators-REFERENCE.json"),
         &sign_validators,
@@ -297,9 +366,9 @@ async fn export_integrations(client: &KcsClient, bundle: &Path) -> Result<()> {
 ///
 /// Returns the first transport, parse, or filesystem error.
 async fn export_notifications_reference(client: &KcsClient, bundle: &Path) -> Result<()> {
-    let email = get_list(client, "/v1/integrations/notification-settings/email").await?;
-    let telegram = get_list(client, "/v1/integrations/notification-settings/telegram").await?;
-    let webhook = get_list(client, "/v1/integrations/notification-settings/webhook").await?;
+    let email = get_list(client, "/integrations/notification-settings/email").await?;
+    let telegram = get_list(client, "/integrations/notification-settings/telegram").await?;
+    let webhook = get_list(client, "/integrations/notification-settings/webhook").await?;
     write_json(
         &bundle.join("integrations/notifications-REFERENCE.json"),
         &json!({"email": email, "telegram": telegram, "webhook": webhook}),
@@ -315,33 +384,31 @@ async fn export_notifications_reference(client: &KcsClient, bundle: &Path) -> Re
 /// [`export_network_reputation`] because it is opaque bytes rather
 /// than JSON.
 ///
-/// All five collections use [`get_list`] (truncated list view). The
-/// known schema-drift caveat in the module-level docs applies: some
-/// fields required by POST are missing from the list projection and
-/// these will fail on import. Migrating these to [`get_list_detailed`]
-/// is the next mechanical fix (tracked in `CLAUDE.md`).
+/// All five use `get_list_detailed`. They used to use the truncated list
+/// view, which drops fields the import POST requires — a runtime
+/// profile's `fileOperationsRules`, for instance, is absent from the list
+/// projection, so the profile both failed to import and skipped the
+/// audit-event rename the `APIv1` bundle needs. Composing the list with
+/// per-item GETs is the fix.
 ///
 /// # Errors
 ///
 /// Returns the first transport, parse, or filesystem error.
 async fn export_policies(client: &KcsClient, bundle: &Path) -> Result<()> {
-    let scanner = get_list(client, "/v1/policies/scanner").await?;
-    write_json(&bundle.join("policies/scanner.json"), &scanner)?;
-
-    let assurance = get_list(client, "/v1/policies/assurance").await?;
-    write_json(&bundle.join("policies/assurance.json"), &assurance)?;
-
-    let runtime_profiles = get_list(client, "/v1/policies/runtime-profile").await?;
-    write_json(
-        &bundle.join("policies/runtime-profiles.json"),
-        &runtime_profiles,
-    )?;
-
-    let runtime = get_list(client, "/v1/policies/runtime").await?;
-    write_json(&bundle.join("policies/runtime.json"), &runtime)?;
-
-    let response = get_list(client, "/v1/policies/response").await?;
-    write_json(&bundle.join("policies/response.json"), &response)?;
+    // (list endpoint, per-item endpoint, bundle file)
+    for (path, file) in [
+        ("/policies/scanner", "policies/scanner.json"),
+        ("/policies/assurance", "policies/assurance.json"),
+        (
+            "/policies/runtime-profile",
+            "policies/runtime-profiles.json",
+        ),
+        ("/policies/runtime", "policies/runtime.json"),
+        ("/policies/response", "policies/response.json"),
+    ] {
+        let detailed = get_list_detailed(client, path, path).await?;
+        write_json(&bundle.join(file), &detailed)?;
+    }
 
     Ok(())
 }
@@ -349,21 +416,33 @@ async fn export_policies(client: &KcsClient, bundle: &Path) -> Result<()> {
 /// # Overview
 ///
 /// Downloads the network-reputation blob via
-/// `GET /v1/policies/custom-reputation/export` and writes it to
+/// `GET /policies/custom-reputation/export` and writes it to
 /// `policies/network-reputation.bin` inside the bundle.
 ///
 /// The blob is opaque to the migrator — it's replayed verbatim during
 /// import via [`crate::client::KcsClient::put_bytes`].
 ///
+/// A 4xx is treated as "the feature was never configured" and no file is
+/// written, which is how every other section already behaves. Before this,
+/// a source instance with no custom reputation list aborted the whole
+/// export at the last step — after every other file had been written but
+/// before `manifest.json`, leaving a bundle that looked merely incomplete.
+///
 /// # Errors
 ///
-/// Returns a transport error from the GET, or a filesystem error if
-/// the parent directory cannot be created or the file cannot be
+/// Returns a non-4xx transport error from the GET, or a filesystem error
+/// if the parent directory cannot be created or the file cannot be
 /// written.
 async fn export_network_reputation(client: &KcsClient, bundle: &Path) -> Result<()> {
-    let bytes = client
-        .get_bytes("/v1/policies/custom-reputation/export")
-        .await?;
+    let bytes = match client.get_bytes("/policies/custom-reputation/export").await {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            if is_client_error(&e) {
+                return Ok(());
+            }
+            return Err(e);
+        }
+    };
     let path = bundle.join("policies/network-reputation.bin");
     let parent = path
         .parent()
@@ -385,7 +464,7 @@ async fn export_network_reputation(client: &KcsClient, bundle: &Path) -> Result<
 ///
 /// Returns the first transport, parse, or filesystem error.
 async fn export_components(client: &KcsClient, bundle: &Path) -> Result<()> {
-    let scanner_priority = get_single(client, "/v1/scanners/priority").await?;
+    let scanner_priority = get_single(client, "/scanners/priority").await?;
     write_json(
         &bundle.join("components/scanner-priority.json"),
         &scanner_priority,
@@ -402,11 +481,203 @@ async fn export_components(client: &KcsClient, bundle: &Path) -> Result<()> {
 ///
 /// Returns the first transport, parse, or filesystem error.
 async fn export_config(client: &KcsClient, bundle: &Path) -> Result<()> {
-    let reports_storage = get_single(client, "/v1/reports/storage/config").await?;
+    let reports_storage = get_single(client, "/reports/storage/config").await?;
     write_json(
         &bundle.join("config/reports-storage.json"),
         &reports_storage,
     )?;
+    Ok(())
+}
+
+/// Entries a preset-aware export keeps for reference but never replays.
+///
+/// KCS ships built-in benchmark frameworks (Kubernetes, MITRE, NSA) and
+/// their controls. They exist on every instance already, so re-creating
+/// them on the target would either fail or duplicate what is there. A
+/// preset is marked `isDefault: true` on a control and
+/// `isDeletable: false` on a framework.
+fn is_preset(item: &Value) -> bool {
+    item.get("isDefault").and_then(Value::as_bool) == Some(true)
+        || item.get("isDeletable").and_then(Value::as_bool) == Some(false)
+}
+
+/// Splits a list into `(custom, preset_count)`.
+///
+/// Only the custom entries are replayable, but the preset count is worth
+/// reporting: an operator who created no custom controls should see that
+/// the exporter looked, rather than wonder whether it ran.
+fn partition_presets(list: &Value) -> (Value, usize) {
+    let Some(items) = list.as_array() else {
+        return (json!([]), 0);
+    };
+    let mut custom = Vec::new();
+    let mut presets = 0;
+    for item in items {
+        if is_preset(item) {
+            presets += 1;
+        } else {
+            custom.push(item.clone());
+        }
+    }
+    (Value::Array(custom), presets)
+}
+
+/// # Overview
+///
+/// Dumps the `benchmark/` section: custom compliance frameworks and the
+/// custom controls they are built from, both new in KCS 2.5.
+///
+/// Controls carry their check as a CEL expression in a `rule` field, which
+/// [`cel::extract`] moves into `CEL/benchmark/control/<slug>.cel` so it can
+/// be read and edited before import.
+///
+/// Built-in frameworks and controls are counted and dropped rather than
+/// written: they exist on every instance, so replaying them would fail or
+/// duplicate.
+///
+/// # Errors
+///
+/// Returns the first transport, parse, or filesystem error.
+async fn export_benchmark(client: &KcsClient, bundle: &Path) -> Result<()> {
+    let controls = get_list_detailed(client, "/benchmark/control", "/benchmark/control").await?;
+    let (mut custom_controls, preset_controls) = partition_presets(&controls);
+    let extracted = cel::extract(&mut custom_controls, bundle, "benchmark/control")?;
+    write_json(&bundle.join("benchmark/controls.json"), &custom_controls)?;
+
+    let frameworks =
+        get_list_detailed(client, "/benchmark/framework", "/benchmark/framework").await?;
+    let (custom_frameworks, preset_frameworks) = partition_presets(&frameworks);
+    write_json(
+        &bundle.join("benchmark/frameworks.json"),
+        &custom_frameworks,
+    )?;
+
+    if preset_controls > 0 || preset_frameworks > 0 {
+        eprintln!(
+            "Note: skipped {preset_frameworks} built-in benchmark framework(s) and \
+             {preset_controls} built-in control(s); they exist on every instance and are \
+             not replayed. Exported {} custom control(s), {extracted} with a CEL rule.",
+            custom_controls.as_array().map_or(0, Vec::len)
+        );
+    }
+    Ok(())
+}
+
+/// # Overview
+///
+/// Dumps the custom assurance controls introduced in KCS 2.5
+/// (`/policies/assurance-control`), with their CEL rules extracted to
+/// `CEL/policies/assurance-control/`.
+///
+/// # Errors
+///
+/// Returns the first transport, parse, or filesystem error.
+async fn export_assurance_controls(client: &KcsClient, bundle: &Path) -> Result<()> {
+    let mut controls = get_list(client, "/policies/assurance-control").await?;
+    cel::extract(&mut controls, bundle, "policies/assurance-control")?;
+    write_json(&bundle.join("policies/assurance-controls.json"), &controls)?;
+    Ok(())
+}
+
+/// # Overview
+///
+/// Dumps admission-controller policies and their custom controls.
+///
+/// This is the resource that did not exist in the migrator before: in
+/// `APIv3` the admission controls left runtime policies and became
+/// `/policies/admission-controller`. A 2.5-to-2.5 migration previously
+/// dropped all admission control silently, because the exporter never
+/// looked at it.
+///
+/// The custom controls carry CEL rules, extracted to
+/// `CEL/policies/admission-controller/control/`.
+///
+/// # Errors
+///
+/// Returns the first transport, parse, or filesystem error.
+async fn export_admission_controller(client: &KcsClient, bundle: &Path) -> Result<()> {
+    let mut controls = get_list(client, "/policies/admission-controller/control").await?;
+    cel::extract(
+        &mut controls,
+        bundle,
+        "policies/admission-controller/control",
+    )?;
+    write_json(&bundle.join("policies/admission-controls.json"), &controls)?;
+
+    let policies = get_list_detailed(
+        client,
+        "/policies/admission-controller",
+        "/policies/admission-controller",
+    )
+    .await?;
+    write_json(
+        &bundle.join("policies/admission-controller.json"),
+        &policies,
+    )?;
+    Ok(())
+}
+
+/// # Overview
+///
+/// Dumps the custom-reputation list state (`/policies/custom-reputation`).
+///
+/// The list's *entries* travel as the opaque blob in
+/// [`export_network_reputation`]; this records which list is active, which
+/// the blob does not carry.
+///
+/// # Errors
+///
+/// Returns the first transport, parse, or filesystem error.
+async fn export_custom_reputation(client: &KcsClient, bundle: &Path) -> Result<()> {
+    let state = get_single(client, "/policies/custom-reputation").await?;
+    write_json(&bundle.join("policies/custom-reputation.json"), &state)?;
+    Ok(())
+}
+
+/// # Overview
+///
+/// Dumps SIEM integrations (`/integrations/siem`) and external scan groups
+/// (`/integrations/external-group`).
+///
+/// SIEM has a full CRUD API in both generations, contrary to the README's
+/// claim that SIEM is configurable only through Helm values. Its POST body
+/// is `address`, `port`, `protocol`, `exportedData` and `name` — no
+/// credentials — so unlike image registries it replays cleanly.
+///
+/// # Errors
+///
+/// Returns the first transport, parse, or filesystem error.
+async fn export_siem_and_external_groups(client: &KcsClient, bundle: &Path) -> Result<()> {
+    let siem = get_list_detailed(client, "/integrations/siem", "/integrations/siem").await?;
+    write_json(&bundle.join("integrations/siem.json"), &siem)?;
+
+    let external = get_list(client, "/integrations/external-group").await?;
+    write_json(&bundle.join("integrations/external-groups.json"), &external)?;
+    Ok(())
+}
+
+/// # Overview
+///
+/// Dumps the `security/` section — the instance's security scopes, as
+/// `scopes-REFERENCE.json`.
+///
+/// Reference-only: `/security/scopes` is **GET-only**, so scopes cannot be
+/// created through the API and the operator has to recreate them by hand
+/// on the target. The file is still essential rather than informational,
+/// because four resource classes reference scopes by ID
+/// (`systemScopes`): assurance policies, runtime policies and profiles,
+/// and — from 2.5 — admission-controller policies, benchmark frameworks
+/// and external groups. The importer reads this file to learn each source
+/// scope's *name*, looks that name up on the target, and rewrites the IDs.
+/// Without it those references would point at the source instance's ID
+/// space and silently scope every policy to nothing.
+///
+/// # Errors
+///
+/// Returns the first transport, parse, or filesystem error.
+async fn export_security_scopes(client: &KcsClient, bundle: &Path) -> Result<()> {
+    let scopes = get_list(client, "/security/scopes").await?;
+    write_json(&bundle.join("security/scopes-REFERENCE.json"), &scopes)?;
     Ok(())
 }
 
@@ -420,20 +691,47 @@ async fn export_config(client: &KcsClient, bundle: &Path) -> Result<()> {
 /// # Errors
 ///
 /// Returns a filesystem error if the file cannot be written.
-fn write_manifest(bundle: &Path, ts: &str, source_url: &str) -> Result<()> {
+fn write_manifest(
+    bundle: &Path,
+    ts: &str,
+    source_url: &str,
+    kcs_version: Option<KcsVersion>,
+    client: &KcsClient,
+) -> Result<()> {
+    // The API generation is the field the importer cannot work without: it is
+    // what decides whether the bodies in this bundle need translating.
+    let manifest = Manifest::new(
+        TOOL_VERSION,
+        ts,
+        source_url,
+        kcs_version,
+        client.api_version(),
+    );
     write_json(
-        &bundle.join("manifest.json"),
-        &json!({
-            "tool_version": TOOL_VERSION,
-            "timestamp": ts,
-            "source_url": source_url,
-        }),
+        &bundle.join(crate::bundle::MANIFEST_FILE),
+        &manifest.to_json(),
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client::{Connection, Timeouts};
+    use crate::version::ApiVersion;
+
+    /// A client for `uri` pinned to `api`, with default timeouts.
+    fn test_client(uri: &str, api: ApiVersion) -> Result<KcsClient> {
+        KcsClient::new(
+            &Connection {
+                base_url: uri,
+                token: "tok",
+                verify_tls: true,
+                host_header: None,
+                timeouts: Timeouts::default(),
+            },
+            api,
+        )
+    }
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -463,6 +761,12 @@ mod tests {
                 .mount(server)
                 .await;
         }
+        // Detail endpoints for the per-item sweep, and the scopes list.
+        Mock::given(method("GET"))
+            .and(path("/v1/security/scopes"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .mount(server)
+            .await;
         for p in ["/v1/scanners/priority", "/v1/reports/storage/config"] {
             Mock::given(method("GET"))
                 .and(path(p))
@@ -490,8 +794,8 @@ mod tests {
         stub_empty(&server).await;
 
         let tmp = tempfile::tempdir()?;
-        let client = KcsClient::new(&server.uri(), "tok", true, None)?;
-        let bundle = export_all(&client, tmp.path()).await?;
+        let client = test_client(&server.uri(), ApiVersion::V1)?;
+        let bundle = export_all(&client, tmp.path(), None).await?;
 
         let data: Value = serde_json::from_str(&std::fs::read_to_string(
             bundle.join("integrations/image-registries.json"),
@@ -511,8 +815,8 @@ mod tests {
         stub_empty(&server).await;
 
         let tmp = tempfile::tempdir()?;
-        let client = KcsClient::new(&server.uri(), "tok", true, None)?;
-        let bundle = export_all(&client, tmp.path()).await?;
+        let client = test_client(&server.uri(), ApiVersion::V1)?;
+        let bundle = export_all(&client, tmp.path(), None).await?;
 
         let manifest: Value =
             serde_json::from_str(&std::fs::read_to_string(bundle.join("manifest.json"))?)?;
@@ -532,8 +836,8 @@ mod tests {
         stub_empty(&server).await;
 
         let tmp = tempfile::tempdir()?;
-        let client = KcsClient::new(&server.uri(), "tok", true, None)?;
-        let bundle = export_all(&client, tmp.path()).await?;
+        let client = test_client(&server.uri(), ApiVersion::V1)?;
+        let bundle = export_all(&client, tmp.path(), None).await?;
 
         let file_name = bundle
             .file_name()
@@ -560,8 +864,8 @@ mod tests {
         stub_empty(&server).await;
 
         let tmp = tempfile::tempdir()?;
-        let client = KcsClient::new(&server.uri(), "tok", true, None)?;
-        let bundle = export_all(&client, tmp.path()).await?;
+        let client = test_client(&server.uri(), ApiVersion::V1)?;
+        let bundle = export_all(&client, tmp.path(), None).await?;
 
         let notif: Value = serde_json::from_str(&std::fs::read_to_string(
             bundle.join("integrations/notifications-REFERENCE.json"),
@@ -588,11 +892,172 @@ mod tests {
         stub_empty(&server).await;
 
         let tmp = tempfile::tempdir()?;
-        let client = KcsClient::new(&server.uri(), "tok", true, None)?;
-        let bundle = export_all(&client, tmp.path()).await?;
+        let client = test_client(&server.uri(), ApiVersion::V1)?;
+        let bundle = export_all(&client, tmp.path(), None).await?;
 
         let bin = std::fs::read(bundle.join("policies/network-reputation.bin"))?;
         assert_eq!(bin, b"binary-data");
+        Ok(())
+    }
+
+    // ---- group 6: deployment tokens must not reach the bundle ----
+
+    #[tokio::test]
+    async fn agent_group_export_strips_the_deployment_token() -> Result<()> {
+        // GET /integrations/agent-group/<id> returns deploymentToken in full --
+        // unlike bindPassword or clientSecret, which come back masked as ***. It is
+        // a live credential that enrols a node-agent into the issuing instance, so
+        // without this step every bundle on disk is credential-bearing.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/integrations/agent-group"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "items": [{"id": "g1", "groupName": "k8s"}]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/integrations/agent-group/g1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "g1",
+                "groupName": "k8s",
+                "deploymentToken": "SECRET-DEPLOY-TOKEN",
+                "kcsNamespace": "kcs",
+                "networkEnabled": true,
+            })))
+            .mount(&server)
+            .await;
+        stub_empty(&server).await;
+
+        let tmp = tempfile::tempdir()?;
+        let client = test_client(&server.uri(), ApiVersion::V1)?;
+        let bundle = export_all(&client, tmp.path(), None).await?;
+
+        let raw = std::fs::read_to_string(bundle.join("integrations/agent-groups.json"))?;
+        assert!(
+            !raw.contains("SECRET-DEPLOY-TOKEN"),
+            "the deployment token must not be written to disk"
+        );
+        let data: Value = serde_json::from_str(&raw)?;
+        assert!(data[0].get("deploymentToken").is_none());
+        // The manifest data an import actually needs is kept.
+        assert_eq!(data[0]["groupName"], "k8s");
+        assert_eq!(data[0]["kcsNamespace"], "kcs");
+        assert_eq!(data[0]["networkEnabled"], json!(true));
+        Ok(())
+    }
+
+    // ---- group 6: policies are exported POST-ready ----
+
+    #[tokio::test]
+    async fn policy_export_composes_per_item_detail_not_the_list_projection() -> Result<()> {
+        // The list projection drops fields POST requires. A runtime profile's
+        // fileOperationsRules is the clearest case: absent from the list, so the
+        // profile both failed to import and skipped the `APIv3` audit-event rename
+        // that depends on walking those rules.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/policies/runtime-profile"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "items": [{"id": "p1", "name": "busybox"}]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/policies/runtime-profile/p1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "p1",
+                "name": "busybox",
+                "fileOperationsRules": {"items": [{"paths": ["/etc"]}]},
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/integrations/image-registries"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"items": []})))
+            .mount(&server)
+            .await;
+        stub_empty(&server).await;
+
+        let tmp = tempfile::tempdir()?;
+        let client = test_client(&server.uri(), ApiVersion::V1)?;
+        let bundle = export_all(&client, tmp.path(), None).await?;
+
+        let data: Value = serde_json::from_str(&std::fs::read_to_string(
+            bundle.join("policies/runtime-profiles.json"),
+        )?)?;
+        assert_eq!(
+            data[0]["fileOperationsRules"]["items"][0]["paths"][0],
+            json!("/etc"),
+            "the detail-only field must be in the bundle"
+        );
+        Ok(())
+    }
+
+    // ---- group 6: an unconfigured feature must not abort the export ----
+
+    #[tokio::test]
+    async fn a_404_on_the_reputation_export_leaves_the_rest_of_the_bundle_intact() -> Result<()> {
+        // This was the one section that aborted on 4xx. It runs near the end, so a
+        // source with no custom reputation list produced a bundle with every other
+        // file written but no manifest.json -- indistinguishable from an export
+        // that was interrupted.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/integrations/image-registries"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"items": []})))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/policies/custom-reputation/export"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        stub_empty(&server).await;
+
+        let tmp = tempfile::tempdir()?;
+        let client = test_client(&server.uri(), ApiVersion::V1)?;
+        let bundle = export_all(&client, tmp.path(), None).await?;
+
+        assert!(
+            !bundle.join("policies/network-reputation.bin").exists(),
+            "an unconfigured feature writes no file"
+        );
+        assert!(
+            bundle.join("manifest.json").exists(),
+            "the export must still complete -- the manifest is what marks it complete"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn security_scopes_are_exported_for_reference() -> Result<()> {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/integrations/image-registries"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"items": []})))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/security/scopes"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                {"id": "s1", "name": "Default scope"}
+            ])))
+            .mount(&server)
+            .await;
+        stub_empty(&server).await;
+
+        let tmp = tempfile::tempdir()?;
+        let client = test_client(&server.uri(), ApiVersion::V1)?;
+        let bundle = export_all(&client, tmp.path(), None).await?;
+
+        let data: Value = serde_json::from_str(&std::fs::read_to_string(
+            bundle.join("security/scopes-REFERENCE.json"),
+        )?)?;
+        // Reference-only -- /security/scopes is GET-only -- but the importer needs
+        // the id-to-name pairing to remap systemScopes onto the target.
+        assert_eq!(data[0]["name"], "Default scope");
+        assert_eq!(data[0]["id"], "s1");
         Ok(())
     }
 }

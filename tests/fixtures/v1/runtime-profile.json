@@ -1,0 +1,54 @@
+{
+  "id": "55555555-5555-4555-8555-555555555555",
+  "name": "example-profile",
+  "description": "",
+  "useRestrictContainerExecutables": true,
+  "containerExecutablesRules": {
+    "blockAll": true,
+    "allowExceptions": true,
+    "allowedPaths": ["sh", "ls"]
+  },
+  "useRestrictIngressConnections": false,
+  "ingressConnectionsRules": { "blockAll": true, "allowedAddrs": {} },
+  "useRestrictEgressConnections": true,
+  "egressConnectionsRules": {
+    "blockAll": false,
+    "allowedAddrs": { "hosts": ["192.0.2.1/32"] }
+  },
+  "useFileThreatProtection": false,
+  "useFileOperations": true,
+  "fileOperationsRules": {
+    "items": [
+      {
+        "paths": ["/etc"],
+        "excludedPaths": [],
+        "auditEvents": {
+          "auditOpenEvents": false,
+          "auditCreateEvents": true,
+          "auditReadEvents": false,
+          "auditWritEvents": true,
+          "auditRenameOrEvents": true,
+          "auditDeleteEvents": false,
+          "auditChangeAccessPermissionsEvents": false,
+          "auditChangeOwnershipEvents": false
+        }
+      },
+      {
+        "paths": ["/var/log"],
+        "excludedPaths": ["/var/log/pods"],
+        "auditEvents": {
+          "auditOpenEvents": true,
+          "auditCreateEvents": false,
+          "auditReadEvents": false,
+          "auditWritEvents": false,
+          "auditRenameOrEvents": false,
+          "auditDeleteEvents": true,
+          "auditChangeAccessPermissionsEvents": false,
+          "auditChangeOwnershipEvents": false
+        }
+      }
+    ]
+  },
+  "systemScopes": ["44444444-4444-4444-8444-444444444444"],
+  "createdByUser": "admin"
+}

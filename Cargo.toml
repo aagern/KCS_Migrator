@@ -1,7 +1,8 @@
 [package]
 name = "kcs_migrator"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
+rust-version = "1.98.1"
 
 [lib]
 name = "kcs_migrator"
@@ -15,12 +16,26 @@ path = "src/main.rs"
 anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive", "env"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# `multipart` is needed by one endpoint only: PUT /policies/custom-reputation/import
+# rejects octet-stream with "request Content-Type isn't multipart/form-data",
+# despite the v3 OpenAPI document declaring octet-stream.
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "multipart",
+    "rustls-tls",
+] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
-tokio = { version = "1", features = ["full"] }
+# Narrowed from `full`: this is an HTTP client, not a server. `rt-multi-thread` + `macros`
+# back `#[tokio::main]`; `time` backs the request timeouts and the paused-clock tests.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 
 [dev-dependencies]
 tempfile = "3"
+# Pins the compile-fail guarantees on IdMapper's borrows: that a target ID
+# cannot outlive the mapper, and cannot be held across a `register`. Those are
+# the two misuses the API is shaped to prevent, and a passing test suite says
+# nothing about code that is supposed to not compile.
+trybuild = "1.0.121"
 wiremock = "0.6"

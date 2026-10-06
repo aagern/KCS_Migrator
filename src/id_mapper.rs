@@ -19,7 +19,7 @@ use thiserror::Error;
 /// no entry to substitute. Both variants are reported up as
 /// [`anyhow::Error`] by the importer with additional context (the
 /// owning policy's name and the missing ID).
-#[derive(Error, Debug, PartialEq)]
+#[derive(Error, Debug, PartialEq, Eq)]
 pub enum MapperError {
     /// The resource type has no entries registered yet — usually means
     /// the dependency-order step that creates this kind of resource
@@ -51,6 +51,7 @@ impl IdMapper {
     ///
     /// Constructs an empty mapper. Equivalent to
     /// [`IdMapper::default`].
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -73,6 +74,68 @@ impl IdMapper {
     /// Looks up the target ID previously registered for
     /// `(resource_type, source_id)`.
     ///
+    /// # Lifetimes
+    ///
+    /// The elided signature is
+    /// `fn resolve<'s>(&'s self, …) -> Result<&'s str, MapperError>`: the
+    /// returned `&str` borrows **the mapper**, not the arguments. The
+    /// mapper owns every `String` it stores and hands out views into
+    /// them, so no caller can keep a target ID after the mapper is gone.
+    ///
+    /// What that looks like from outside:
+    ///
+    /// ```
+    /// use kcs_migrator::id_mapper::IdMapper;
+    /// use serde_json::{json, Value};
+    ///
+    /// fn rewrite_profile_id(mapper: &IdMapper, block: &mut Value) -> anyhow::Result<()> {
+    ///     let old = block["runtimeProfileId"].as_str().unwrap_or_default();
+    ///     // `to_string()` ends the borrow of `mapper` before `block` is written —
+    ///     // and, more importantly, before the caller's loop touches `mapper` again.
+    ///     let new = mapper.resolve("runtime-profile", old)?.to_string();
+    ///     block["runtimeProfileId"] = Value::String(new);
+    ///     Ok(())
+    /// }
+    ///
+    /// let mut mapper = IdMapper::new();
+    /// mapper.register("runtime-profile", "src-001", "tgt-999");
+    /// let mut block = json!({"runtimeProfileId": "src-001"});
+    /// rewrite_profile_id(&mapper, &mut block).unwrap();
+    /// assert_eq!(block["runtimeProfileId"], "tgt-999");
+    /// ```
+    ///
+    /// Two misuses the signature rules out. Returning the borrow from a
+    /// function that owns the mapper:
+    ///
+    /// ```compile_fail
+    /// use kcs_migrator::id_mapper::IdMapper;
+    ///
+    /// fn broken() -> &'static str {
+    ///     let mut mapper = IdMapper::new();
+    ///     mapper.register("runtime-profile", "src", "tgt");
+    ///     mapper.resolve("runtime-profile", "src").unwrap() // mapper dropped here
+    /// }
+    /// ```
+    ///
+    /// And holding the result across a [`Self::register`], which needs
+    /// `&mut self` while the shared borrow is still live:
+    ///
+    /// ```compile_fail
+    /// use kcs_migrator::id_mapper::IdMapper;
+    ///
+    /// let mut mapper = IdMapper::new();
+    /// mapper.register("runtime-profile", "a", "x");
+    /// let held = mapper.resolve("runtime-profile", "a").unwrap();
+    /// mapper.register("runtime-profile", "b", "y"); // cannot borrow as mutable
+    /// println!("{held}");
+    /// ```
+    ///
+    /// Returning `String` instead would make both compile, at the cost of
+    /// an allocation on every foreign-key rewrite and of losing the
+    /// guarantee. Both cases are also pinned as `trybuild` tests in
+    /// `tests/ui/`, so a change that relaxed them would fail the suite
+    /// rather than pass silently.
+    ///
     /// # Errors
     ///
     /// Returns [`MapperError::UnknownType`] if no resource of that type
@@ -86,11 +149,84 @@ impl IdMapper {
             .ok_or_else(|| MapperError::UnknownType(resource_type.to_string()))?;
         type_map
             .get(source_id)
-            .map(|s| s.as_str())
+            .map(String::as_str)
             .ok_or_else(|| MapperError::UnknownId {
                 resource_type: resource_type.to_string(),
                 source_id: source_id.to_string(),
             })
+    }
+
+    /// # Overview
+    ///
+    /// Like [`Self::resolve`] but yields `None` instead of an error when
+    /// there is no mapping.
+    ///
+    /// For the call sites that degrade rather than abort: a security scope
+    /// that does not exist on the target is dropped with a warning, not
+    /// treated as a corrupt bundle. Built as its own method rather than
+    /// `resolve(..).ok()` because that form discards the error without
+    /// recording that it ever happened, and these call sites need to tell
+    /// the operator which lookup failed.
+    ///
+    /// # Lifetimes
+    ///
+    /// Same borrow as [`Self::resolve`]: the `&str` inside the `Option`
+    /// borrows the mapper, so it must be copied out before the mapper is
+    /// mutated again.
+    ///
+    /// ```
+    /// use kcs_migrator::id_mapper::IdMapper;
+    ///
+    /// let mut mapper = IdMapper::new();
+    /// mapper.register("scope", "src-scope", "tgt-scope");
+    ///
+    /// // Collect owned values, so the loop can go on to register more.
+    /// let resolved: Vec<String> = ["src-scope", "absent"]
+    ///     .iter()
+    ///     .filter_map(|id| mapper.resolve_opt("scope", id))
+    ///     .map(ToString::to_string)
+    ///     .collect();
+    ///
+    /// assert_eq!(resolved, vec!["tgt-scope".to_string()]);
+    /// mapper.register("scope", "another", "tgt-2");
+    /// ```
+    #[must_use]
+    pub fn resolve_opt(&self, resource_type: &str, source_id: &str) -> Option<&str> {
+        self.map
+            .get(resource_type)
+            .and_then(|type_map| type_map.get(source_id))
+            .map(String::as_str)
+    }
+
+    /// # Overview
+    ///
+    /// Records that `resource_type` was *considered*, without adding a
+    /// mapping.
+    ///
+    /// This exists because "no mappings" and "no mappings, and that is
+    /// meaningful" are different states. Security scopes are the case:
+    /// a bundle with no scope reference file must leave `systemScopes`
+    /// untouched, while a bundle that *has* one whose names matched
+    /// nothing on the target must drop those IDs — the target accepts a
+    /// stale ID and silently scopes the policy to nothing. Both states
+    /// have an empty map, so without this marker they are
+    /// indistinguishable and one of them is handled wrongly.
+    pub fn declare_type(&mut self, resource_type: &str) {
+        self.map.entry(resource_type.to_string()).or_default();
+    }
+
+    /// # Overview
+    ///
+    /// Whether `resource_type` has been declared or populated.
+    ///
+    /// True after either [`Self::register`] or [`Self::declare_type`].
+    /// Lets a caller distinguish "this resource class was never
+    /// considered" — so remapping should be skipped entirely — from
+    /// "considered, but this particular ID has no counterpart", which
+    /// means the reference is stale and must not be passed through.
+    #[must_use]
+    pub fn has_type(&self, resource_type: &str) -> bool {
+        self.map.contains_key(resource_type)
     }
 }
 
@@ -124,6 +260,47 @@ mod tests {
             m.resolve("runtime-profile", "bad-id"),
             Err(MapperError::UnknownId { .. })
         ));
+    }
+
+    #[test]
+    fn resolve_opt_yields_none_instead_of_an_error() {
+        let mut m = IdMapper::new();
+        m.register("scope", "src-1", "tgt-1");
+        assert_eq!(m.resolve_opt("scope", "src-1"), Some("tgt-1"));
+        // Unknown ID within a known type, and an entirely unknown type, are both
+        // None -- the caller that degrades gracefully does not care which.
+        assert_eq!(m.resolve_opt("scope", "absent"), None);
+        assert_eq!(m.resolve_opt("never-registered", "src-1"), None);
+    }
+
+    #[test]
+    fn has_type_separates_never_considered_from_missing_entry() {
+        let mut m = IdMapper::new();
+        assert!(!m.has_type("scope"));
+        m.register("scope", "src-1", "tgt-1");
+        assert!(m.has_type("scope"));
+        // Considered, but this ID is not in it: the reference is stale and must
+        // not be passed through, unlike the never-considered case.
+        assert!(m.resolve_opt("scope", "other").is_none());
+    }
+
+    #[test]
+    fn declare_type_marks_a_class_considered_without_adding_a_mapping() {
+        let mut m = IdMapper::new();
+        m.declare_type("scope");
+        assert!(
+            m.has_type("scope"),
+            "a bundle that listed its scopes was considered, even if none matched"
+        );
+        assert_eq!(m.resolve_opt("scope", "anything"), None);
+    }
+
+    #[test]
+    fn declare_type_does_not_clobber_existing_mappings() {
+        let mut m = IdMapper::new();
+        m.register("scope", "src-1", "tgt-1");
+        m.declare_type("scope");
+        assert_eq!(m.resolve_opt("scope", "src-1"), Some("tgt-1"));
     }
 
     #[test]

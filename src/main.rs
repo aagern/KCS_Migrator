@@ -1,13 +1,26 @@
+#![forbid(unsafe_code)]
+#![warn(clippy::pedantic, clippy::nursery)]
+#![deny(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::todo,
+    clippy::unimplemented
+)]
+
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
 
-use kcs_migrator::client::KcsClient;
+use kcs_migrator::cli::ConnOpts;
+use kcs_migrator::importer::ImportOptions;
 use kcs_migrator::{export, importer, users};
 
 #[derive(Parser)]
 #[command(
     name = "kcs-migrator",
+    version,
     about = "Export and import KCS configuration bundles"
 )]
 struct Cli {
@@ -15,34 +28,58 @@ struct Cli {
     command: Commands,
 }
 
+/// Options for the `kubectl exec` user export, which is reference-only
+/// and talks to the cluster rather than to the KCS API.
+#[derive(Args)]
+struct UserExportOpts {
+    /// Kubernetes namespace holding the KCS release.
+    #[arg(long, default_value = "kcs")]
+    namespace: String,
+
+    /// `StatefulSet` name of the KCS Postgres pod.
+    #[arg(long, default_value = "kcs-postgresql")]
+    users_pod_selector: String,
+
+    /// Skip the `kubectl exec` user export step.
+    #[arg(long)]
+    skip_users: bool,
+}
+
 #[derive(Subcommand)]
 enum Commands {
+    /// Export KCS configuration to a timestamped bundle directory.
     Export {
-        #[arg(long, env = "KCS_URL")]
-        url: String,
-        #[arg(long, env = "KCS_TOKEN")]
-        token: String,
+        #[command(flatten)]
+        conn: ConnOpts,
+
+        /// Directory to write the bundle into.
         #[arg(long, default_value = ".")]
         output: PathBuf,
-        #[arg(long)]
-        no_verify_tls: bool,
-        #[arg(long)]
-        host_header: Option<String>,
-        #[arg(long, default_value = "kcs")]
-        namespace: String,
-        #[arg(long, default_value = "kcs-postgresql")]
-        users_pod_selector: String,
-        #[arg(long)]
-        skip_users: bool,
+
+        #[command(flatten)]
+        users: UserExportOpts,
     },
+
+    /// Restore a bundle to a target KCS instance.
     ImportBundle {
+        /// Path to the bundle directory.
         bundle: PathBuf,
-        #[arg(long, env = "KCS_URL")]
-        url: String,
-        #[arg(long, env = "KCS_TOKEN")]
-        token: String,
+
+        #[command(flatten)]
+        conn: ConnOpts,
+
+        /// Resolve and describe every call without sending a single write.
         #[arg(long)]
-        no_verify_tls: bool,
+        dry_run: bool,
+
+        /// Abort instead of continuing when a response policy references a
+        /// notification channel that cannot be recreated on the target.
+        ///
+        /// Notification channels have no create endpoint in the KCS API, so by
+        /// default such a policy is imported without them and the operator is
+        /// warned that it will notify nobody until they are reattached by hand.
+        #[arg(long)]
+        strict_notifications: bool,
     },
 }
 
@@ -52,22 +89,24 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::Export {
-            url,
-            token,
+            conn,
             output,
-            no_verify_tls,
-            host_header,
-            namespace,
-            users_pod_selector,
-            skip_users,
+            users: user_opts,
         } => {
-            let verify_tls = !no_verify_tls;
-            let client = KcsClient::new(&url, &token, verify_tls, host_header.as_deref())?;
-            let bundle = export::export_all(&client, &output).await?;
+            let (client, resolved) = conn.connect().await?;
+            println!("Source: {resolved}");
+
+            // The manifest records the source release, so the importer can say which
+            // instance a bundle came from when it refuses a downgrade.
+            let bundle = export::export_all(&client, &output, resolved.kcs_version()).await?;
             println!("Bundle exported to: {}", bundle.display());
 
-            if !skip_users {
-                match users::export_users_reference(&namespace, &bundle, &users_pod_selector) {
+            if !user_opts.skip_users {
+                match users::export_users_reference(
+                    &user_opts.namespace,
+                    &bundle,
+                    &user_opts.users_pod_selector,
+                ) {
                     Ok(_) => println!("User reference exported successfully."),
                     Err(e) => eprintln!("Warning: Failed to export users: {e}"),
                 }
@@ -75,14 +114,28 @@ async fn main() -> Result<()> {
         }
         Commands::ImportBundle {
             bundle,
-            url,
-            token,
-            no_verify_tls,
+            conn,
+            dry_run,
+            strict_notifications,
         } => {
-            let verify_tls = !no_verify_tls;
-            let client = KcsClient::new(&url, &token, verify_tls, None)?;
-            importer::import_bundle(&client, &bundle).await?;
-            println!("Import complete.");
+            let (client, resolved) = conn.connect().await?;
+            let client = client.with_dry_run(dry_run);
+            println!("Target: {resolved}");
+            if dry_run {
+                println!("DRY RUN: no write will be sent to the target.");
+            }
+
+            let options = ImportOptions {
+                strict_notifications,
+                target_kcs: resolved.kcs_version(),
+            };
+            importer::import_bundle(&client, &bundle, &options).await?;
+
+            if dry_run {
+                println!("Dry run complete. Nothing was written.");
+            } else {
+                println!("Import complete.");
+            }
         }
     }
 

@@ -26,4 +26,9 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 
 [dev-dependencies]
 tempfile = "3"
+# Pins the compile-fail guarantees on IdMapper's borrows: that a target ID
+# cannot outlive the mapper, and cannot be held across a `register`. Those are
+# the two misuses the API is shaped to prevent, and a passing test suite says
+# nothing about code that is supposed to not compile.
+trybuild = "1.0.121"
 wiremock = "0.6"

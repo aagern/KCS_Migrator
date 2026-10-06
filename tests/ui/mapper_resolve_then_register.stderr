@@ -1,0 +1,11 @@
+error[E0502]: cannot borrow `mapper` as mutable because it is also borrowed as immutable
+  --> tests/ui/mapper_resolve_then_register.rs:19:5
+   |
+16 |     let held = mapper.resolve("runtime-profile", "src-001").unwrap();
+   |                ------ immutable borrow occurs here
+...
+19 |     mapper.register("runtime-profile", "src-002", "tgt-998");
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ mutable borrow occurs here
+20 |
+21 |     println!("{held}");
+   |                ---- immutable borrow later used here

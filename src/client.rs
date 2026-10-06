@@ -514,6 +514,26 @@ impl KcsClient {
     /// trailing slash stripped and without the version segment. Used by
     /// [`crate::export::export_all`] to record the source URL in the
     /// bundle manifest.
+    ///
+    /// # Lifetimes
+    ///
+    /// Returns `&'s str` borrowed from `&'s self`. Unlike
+    /// [`crate::id_mapper::IdMapper::resolve`] this is rarely a
+    /// constraint in practice, because a `KcsClient` normally outlives
+    /// every use of its URL — but the borrow is still real:
+    ///
+    /// ```
+    /// use kcs_migrator::client::{KcsClient, Timeouts};
+    /// use kcs_migrator::version::ApiVersion;
+    ///
+    /// let client = KcsClient::new(
+    ///     "https://kcs.demo.lab/api/", "tok", true, None,
+    ///     ApiVersion::V3, Timeouts::default(),
+    /// ).unwrap();
+    ///
+    /// // Borrowed, trailing slash stripped, no version segment.
+    /// assert_eq!(client.base_url(), "https://kcs.demo.lab/api");
+    /// ```
     #[must_use]
     pub fn base_url(&self) -> &str {
         &self.base

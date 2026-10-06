@@ -74,6 +74,68 @@ impl IdMapper {
     /// Looks up the target ID previously registered for
     /// `(resource_type, source_id)`.
     ///
+    /// # Lifetimes
+    ///
+    /// The elided signature is
+    /// `fn resolve<'s>(&'s self, …) -> Result<&'s str, MapperError>`: the
+    /// returned `&str` borrows **the mapper**, not the arguments. The
+    /// mapper owns every `String` it stores and hands out views into
+    /// them, so no caller can keep a target ID after the mapper is gone.
+    ///
+    /// What that looks like from outside:
+    ///
+    /// ```
+    /// use kcs_migrator::id_mapper::IdMapper;
+    /// use serde_json::{json, Value};
+    ///
+    /// fn rewrite_profile_id(mapper: &IdMapper, block: &mut Value) -> anyhow::Result<()> {
+    ///     let old = block["runtimeProfileId"].as_str().unwrap_or_default();
+    ///     // `to_string()` ends the borrow of `mapper` before `block` is written —
+    ///     // and, more importantly, before the caller's loop touches `mapper` again.
+    ///     let new = mapper.resolve("runtime-profile", old)?.to_string();
+    ///     block["runtimeProfileId"] = Value::String(new);
+    ///     Ok(())
+    /// }
+    ///
+    /// let mut mapper = IdMapper::new();
+    /// mapper.register("runtime-profile", "src-001", "tgt-999");
+    /// let mut block = json!({"runtimeProfileId": "src-001"});
+    /// rewrite_profile_id(&mapper, &mut block).unwrap();
+    /// assert_eq!(block["runtimeProfileId"], "tgt-999");
+    /// ```
+    ///
+    /// Two misuses the signature rules out. Returning the borrow from a
+    /// function that owns the mapper:
+    ///
+    /// ```compile_fail
+    /// use kcs_migrator::id_mapper::IdMapper;
+    ///
+    /// fn broken() -> &'static str {
+    ///     let mut mapper = IdMapper::new();
+    ///     mapper.register("runtime-profile", "src", "tgt");
+    ///     mapper.resolve("runtime-profile", "src").unwrap() // mapper dropped here
+    /// }
+    /// ```
+    ///
+    /// And holding the result across a [`Self::register`], which needs
+    /// `&mut self` while the shared borrow is still live:
+    ///
+    /// ```compile_fail
+    /// use kcs_migrator::id_mapper::IdMapper;
+    ///
+    /// let mut mapper = IdMapper::new();
+    /// mapper.register("runtime-profile", "a", "x");
+    /// let held = mapper.resolve("runtime-profile", "a").unwrap();
+    /// mapper.register("runtime-profile", "b", "y"); // cannot borrow as mutable
+    /// println!("{held}");
+    /// ```
+    ///
+    /// Returning `String` instead would make both compile, at the cost of
+    /// an allocation on every foreign-key rewrite and of losing the
+    /// guarantee. Both cases are also pinned as `trybuild` tests in
+    /// `tests/ui/`, so a change that relaxed them would fail the suite
+    /// rather than pass silently.
+    ///
     /// # Errors
     ///
     /// Returns [`MapperError::UnknownType`] if no resource of that type
@@ -105,6 +167,29 @@ impl IdMapper {
     /// `resolve(..).ok()` because that form discards the error without
     /// recording that it ever happened, and these call sites need to tell
     /// the operator which lookup failed.
+    ///
+    /// # Lifetimes
+    ///
+    /// Same borrow as [`Self::resolve`]: the `&str` inside the `Option`
+    /// borrows the mapper, so it must be copied out before the mapper is
+    /// mutated again.
+    ///
+    /// ```
+    /// use kcs_migrator::id_mapper::IdMapper;
+    ///
+    /// let mut mapper = IdMapper::new();
+    /// mapper.register("scope", "src-scope", "tgt-scope");
+    ///
+    /// // Collect owned values, so the loop can go on to register more.
+    /// let resolved: Vec<String> = ["src-scope", "absent"]
+    ///     .iter()
+    ///     .filter_map(|id| mapper.resolve_opt("scope", id))
+    ///     .map(ToString::to_string)
+    ///     .collect();
+    ///
+    /// assert_eq!(resolved, vec!["tgt-scope".to_string()]);
+    /// mapper.register("scope", "another", "tgt-2");
+    /// ```
     #[must_use]
     pub fn resolve_opt(&self, resource_type: &str, source_id: &str) -> Option<&str> {
         self.map

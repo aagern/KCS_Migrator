@@ -49,6 +49,7 @@
 //! | [`export`]    | Dumps a source KCS to a versioned bundle directory. |
 //! | [`importer`]  | Replays a bundle onto a target KCS in dependency order. |
 //! | [`id_mapper`] | Source→target ID registry used during import to rewrite FK fields. |
+//! | [`translate`] | Rewrites bundle bodies between API generations (forward-only, v1 to v3). |
 //! | [`users`]     | Reference-only user export via `kubectl exec` against the KCS Postgres pod. |
 //! | [`version`]   | Which API generation an instance speaks, and how to tell from its release. |
 //!
@@ -89,5 +90,6 @@ pub mod client;
 pub mod export;
 pub mod id_mapper;
 pub mod importer;
+pub mod translate;
 pub mod users;
 pub mod version;

@@ -61,6 +61,40 @@ pub enum Resolved {
     Pinned(ApiVersion),
 }
 
+impl Resolved {
+    /// # Overview
+    ///
+    /// The release behind this connection, when one was detected.
+    ///
+    /// `None` for a pinned generation: `--api-version` deliberately sends
+    /// no probe, so there is no release to report. The bundle manifest
+    /// records `null` in that case rather than a guess.
+    #[must_use]
+    pub const fn kcs_version(&self) -> Option<KcsVersion> {
+        match self {
+            Self::Detected(v) => Some(*v),
+            Self::Pinned(_) => None,
+        }
+    }
+
+    /// # Overview
+    ///
+    /// The API generation in use, however it was arrived at.
+    ///
+    /// Not `const`: it defers to [`ApiVersion::for_kcs`], which compares
+    /// through the derived `Ord` on [`KcsVersion`] and so cannot be
+    /// const-evaluated. Hand-rolling the comparison here to win `const`
+    /// would duplicate the version gate in a second place, which is the
+    /// thing the ordering test exists to prevent.
+    #[must_use]
+    pub fn api_version(&self) -> ApiVersion {
+        match self {
+            Self::Detected(v) => ApiVersion::for_kcs(*v),
+            Self::Pinned(api) => *api,
+        }
+    }
+}
+
 impl std::fmt::Display for Resolved {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {

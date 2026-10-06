@@ -44,6 +44,8 @@
 //!
 //! | Module | Responsibility |
 //! |---|---|
+//! | [`bundle`]    | The bundle `manifest.json`: format version, source release, API generation. |
+//! | [`cel`]       | CEL rules as editable `.cel` text files instead of escaped JSON strings. |
 //! | [`cli`]       | Connection options shared by the subcommands, and how they become a client. |
 //! | [`client`]    | Async [`reqwest`] wrapper that injects the `Tron-Token` auth header. |
 //! | [`export`]    | Dumps a source KCS to a versioned bundle directory. |
@@ -74,7 +76,7 @@
 //! let (source, src_kcs) = KcsClient::detect(
 //!     "https://kcs.src.corp", "tok", true, None, Timeouts::default(),
 //! ).await?;
-//! let bundle = export::export_all(&source, Path::new(".")).await?;
+//! let bundle = export::export_all(&source, Path::new("."), Some(src_kcs)).await?;
 //!
 //! let (target, tgt_kcs) = KcsClient::detect(
 //!     "https://kcs.tgt.corp", "tok", true, None, Timeouts::default(),
@@ -87,6 +89,8 @@
 //! # }
 //! ```
 
+pub mod bundle;
+pub mod cel;
 pub mod cli;
 pub mod client;
 pub mod export;

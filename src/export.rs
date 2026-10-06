@@ -16,7 +16,9 @@
 //! POST-ready schema. List-only resources (reference dumps) can use
 //! `get_list` directly.
 
+use crate::bundle::Manifest;
 use crate::client::{is_client_error, KcsClient};
+use crate::version::KcsVersion;
 use anyhow::{anyhow, Result};
 use chrono::Utc;
 use serde_json::{json, Value};
@@ -192,11 +194,15 @@ async fn get_list_detailed(
 ///     "https://kcs.src.corp", "tok", true, None, Timeouts::default(),
 /// ).await?;
 /// println!("source is KCS {kcs}, speaking {:?}", client.api_version());
-/// let bundle = export::export_all(&client, Path::new(".")).await?;
+/// let bundle = export::export_all(&client, Path::new("."), Some(kcs)).await?;
 /// println!("bundle: {}", bundle.display());
 /// # Ok(()) }
 /// ```
-pub async fn export_all(client: &KcsClient, output_dir: &Path) -> Result<PathBuf> {
+pub async fn export_all(
+    client: &KcsClient,
+    output_dir: &Path,
+    kcs_version: Option<KcsVersion>,
+) -> Result<PathBuf> {
     let ts = Utc::now().format("%Y-%m-%d_%H-%M-%S").to_string();
     let bundle = output_dir.join(format!("kcs-export-{ts}"));
 
@@ -210,7 +216,7 @@ pub async fn export_all(client: &KcsClient, output_dir: &Path) -> Result<PathBuf
     // Written last, deliberately: the absence of `manifest.json` is what marks a
     // bundle directory as incomplete, and the importer refuses such a directory
     // before writing anything to the target.
-    write_manifest(&bundle, &ts, client.base_url())?;
+    write_manifest(&bundle, &ts, client.base_url(), kcs_version, client)?;
 
     Ok(bundle)
 }
@@ -483,14 +489,25 @@ async fn export_security_scopes(client: &KcsClient, bundle: &Path) -> Result<()>
 /// # Errors
 ///
 /// Returns a filesystem error if the file cannot be written.
-fn write_manifest(bundle: &Path, ts: &str, source_url: &str) -> Result<()> {
+fn write_manifest(
+    bundle: &Path,
+    ts: &str,
+    source_url: &str,
+    kcs_version: Option<KcsVersion>,
+    client: &KcsClient,
+) -> Result<()> {
+    // The API generation is the field the importer cannot work without: it is
+    // what decides whether the bodies in this bundle need translating.
+    let manifest = Manifest::new(
+        TOOL_VERSION,
+        ts,
+        source_url,
+        kcs_version,
+        client.api_version(),
+    );
     write_json(
-        &bundle.join("manifest.json"),
-        &json!({
-            "tool_version": TOOL_VERSION,
-            "timestamp": ts,
-            "source_url": source_url,
-        }),
+        &bundle.join(crate::bundle::MANIFEST_FILE),
+        &manifest.to_json(),
     )
 }
 
@@ -569,7 +586,7 @@ mod tests {
             ApiVersion::V1,
             Timeouts::default(),
         )?;
-        let bundle = export_all(&client, tmp.path()).await?;
+        let bundle = export_all(&client, tmp.path(), None).await?;
 
         let data: Value = serde_json::from_str(&std::fs::read_to_string(
             bundle.join("integrations/image-registries.json"),
@@ -597,7 +614,7 @@ mod tests {
             ApiVersion::V1,
             Timeouts::default(),
         )?;
-        let bundle = export_all(&client, tmp.path()).await?;
+        let bundle = export_all(&client, tmp.path(), None).await?;
 
         let manifest: Value =
             serde_json::from_str(&std::fs::read_to_string(bundle.join("manifest.json"))?)?;
@@ -625,7 +642,7 @@ mod tests {
             ApiVersion::V1,
             Timeouts::default(),
         )?;
-        let bundle = export_all(&client, tmp.path()).await?;
+        let bundle = export_all(&client, tmp.path(), None).await?;
 
         let file_name = bundle
             .file_name()
@@ -660,7 +677,7 @@ mod tests {
             ApiVersion::V1,
             Timeouts::default(),
         )?;
-        let bundle = export_all(&client, tmp.path()).await?;
+        let bundle = export_all(&client, tmp.path(), None).await?;
 
         let notif: Value = serde_json::from_str(&std::fs::read_to_string(
             bundle.join("integrations/notifications-REFERENCE.json"),
@@ -695,7 +712,7 @@ mod tests {
             ApiVersion::V1,
             Timeouts::default(),
         )?;
-        let bundle = export_all(&client, tmp.path()).await?;
+        let bundle = export_all(&client, tmp.path(), None).await?;
 
         let bin = std::fs::read(bundle.join("policies/network-reputation.bin"))?;
         assert_eq!(bin, b"binary-data");
@@ -740,7 +757,7 @@ mod tests {
             ApiVersion::V1,
             Timeouts::default(),
         )?;
-        let bundle = export_all(&client, tmp.path()).await?;
+        let bundle = export_all(&client, tmp.path(), None).await?;
 
         let raw = std::fs::read_to_string(bundle.join("integrations/agent-groups.json"))?;
         assert!(
@@ -797,7 +814,7 @@ mod tests {
             ApiVersion::V1,
             Timeouts::default(),
         )?;
-        let bundle = export_all(&client, tmp.path()).await?;
+        let bundle = export_all(&client, tmp.path(), None).await?;
 
         let data: Value = serde_json::from_str(&std::fs::read_to_string(
             bundle.join("policies/runtime-profiles.json"),
@@ -840,7 +857,7 @@ mod tests {
             ApiVersion::V1,
             Timeouts::default(),
         )?;
-        let bundle = export_all(&client, tmp.path()).await?;
+        let bundle = export_all(&client, tmp.path(), None).await?;
 
         assert!(
             !bundle.join("policies/network-reputation.bin").exists(),
@@ -879,7 +896,7 @@ mod tests {
             ApiVersion::V1,
             Timeouts::default(),
         )?;
-        let bundle = export_all(&client, tmp.path()).await?;
+        let bundle = export_all(&client, tmp.path(), None).await?;
 
         let data: Value = serde_json::from_str(&std::fs::read_to_string(
             bundle.join("security/scopes-REFERENCE.json"),

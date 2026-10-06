@@ -96,7 +96,9 @@ async fn main() -> Result<()> {
             let (client, resolved) = conn.connect().await?;
             println!("Source: {resolved}");
 
-            let bundle = export::export_all(&client, &output).await?;
+            // The manifest records the source release, so the importer can say which
+            // instance a bundle came from when it refuses a downgrade.
+            let bundle = export::export_all(&client, &output, resolved.kcs_version()).await?;
             println!("Bundle exported to: {}", bundle.display());
 
             if !user_opts.skip_users {
@@ -125,6 +127,7 @@ async fn main() -> Result<()> {
 
             let options = ImportOptions {
                 strict_notifications,
+                target_kcs: resolved.kcs_version(),
             };
             importer::import_bundle(&client, &bundle, &options).await?;
 

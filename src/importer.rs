@@ -29,8 +29,11 @@
 //! continue. All other failures abort the import to preserve the
 //! strict-error contract for genuine bugs.
 
+use crate::bundle::Manifest;
 use crate::client::{error_status, KcsClient};
 use crate::id_mapper::IdMapper;
+use crate::translate::{Resource, Translator};
+use crate::version::KcsVersion;
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
 use std::path::Path;
@@ -139,6 +142,29 @@ async fn enable_policy(client: &KcsClient, endpoint: &str, tgt_id: &str) -> Resu
     Ok(())
 }
 
+/// Translates a body in place and reports what changed.
+///
+/// A rename is routine and goes out as a `Note`; a *dropped* field is not,
+/// because it is configuration that existed on the source and will not
+/// exist on the target. Saying so per resource is the only way an operator
+/// can tell which policies to re-check by hand after a 2.4 to 2.5 move.
+fn report_translation(
+    translator: Translator,
+    resource: Resource,
+    body: &mut Value,
+    kind: &str,
+    name: &str,
+) {
+    let changes = translator.resource(resource, body);
+    if !changes.dropped.is_empty() {
+        eprintln!(
+            "Note: {kind} '{name}': {:?} removed -- APIv3 has no equivalent field. \
+             Check the resource on the target if it relied on them.",
+            changes.dropped
+        );
+    }
+}
+
 /// Reports a bundle entry with no usable source `id` and tells the caller
 /// to skip it.
 ///
@@ -189,6 +215,15 @@ pub struct ImportOptions {
     /// generation, so the mapper is *never* populated for them and any
     /// response policy wired to a channel would stop the import.
     pub strict_notifications: bool,
+
+    /// The target instance's release, when it was detected.
+    ///
+    /// Used only to name both sides when a downgrade is refused. Carried
+    /// here rather than on [`KcsClient`] because a client built with an
+    /// explicit `--api-version` never probed and so has no release to
+    /// report, and widening the client with a field that is sometimes
+    /// absent would push that `Option` into every call site.
+    pub target_kcs: Option<KcsVersion>,
 }
 
 /// Builds the source-ID → target-ID mapping for security scopes.
@@ -473,6 +508,7 @@ async fn import_agent_groups(
     client: &KcsClient,
     bundle: &Path,
     mapper: &mut IdMapper,
+    translator: Translator,
 ) -> Result<()> {
     let groups = read_json(&bundle.join("integrations/agent-groups.json"))?;
     let arr = match groups.as_array() {
@@ -486,10 +522,15 @@ async fn import_agent_groups(
             continue;
         };
         let name = name_or_id(group, "groupName", &src_id).to_string();
-        match client
-            .post("/integrations/agent-group", &strip(group))
-            .await
-        {
+        let mut body = strip(group);
+        report_translation(
+            translator,
+            Resource::AgentGroup,
+            &mut body,
+            "agent group",
+            &name,
+        );
+        match client.post("/integrations/agent-group", &body).await {
             Ok(result) => {
                 let tgt_id = tgt_id_from(&result, &format!("agent group '{name}'"))?;
                 mapper.register("agent-group", &src_id, &tgt_id);
@@ -507,6 +548,31 @@ async fn import_agent_groups(
     Ok(())
 }
 
+/// Identifies one "simple" policy collection — one that needs no
+/// foreign-key rewriting, just create plus an optional enable.
+///
+/// Grouped into a struct because passing these four alongside the client,
+/// bundle, mapper and translator put the function at eight arguments,
+/// which `clippy::too_many_arguments` flags and which is genuinely hard to
+/// call correctly: `file_rel`, `endpoint` and `resource_type` are all
+/// `&str`, so a transposed pair compiles and then writes the wrong
+/// resource to the wrong endpoint.
+///
+/// The lifetime ties the three borrowed names to the caller's string
+/// literals; nothing here owns them, because every call site passes
+/// constants.
+#[derive(Debug, Clone, Copy)]
+struct PolicyCollection<'a> {
+    /// Bundle-relative JSON file holding the collection.
+    file_rel: &'a str,
+    /// Version-relative API endpoint to POST to.
+    endpoint: &'a str,
+    /// Mapper resource type to register created IDs under.
+    resource_type: &'a str,
+    /// Which translation rules apply to this collection.
+    resource: Resource,
+}
+
 /// Replays a "simple" policy collection — one that needs no FK
 /// rewriting, just create + optional enable. Used for scanner and
 /// assurance policies, which share the same shape.
@@ -521,11 +587,16 @@ async fn import_agent_groups(
 async fn import_simple_policy_collection(
     client: &KcsClient,
     bundle: &Path,
-    file_rel: &str,
-    endpoint: &str,
-    resource_type: &str,
+    collection: &PolicyCollection<'_>,
     mapper: &mut IdMapper,
+    translator: Translator,
 ) -> Result<()> {
+    let PolicyCollection {
+        file_rel,
+        endpoint,
+        resource_type,
+        resource,
+    } = *collection;
     let policies = read_json(&bundle.join(file_rel))?;
     let arr = match policies.as_array() {
         Some(a) => a.clone(),
@@ -538,9 +609,11 @@ async fn import_simple_policy_collection(
             continue;
         };
         let enabled = pol["enabled"].as_bool().unwrap_or(false);
+        let name = name_or_id(pol, "name", &src_id).to_string();
         let mut body = strip(pol);
+        report_translation(translator, resource, &mut body, resource_type, &name);
         let unscoped = remap_system_scopes(&mut body, mapper);
-        warn_dropped_scopes(resource_type, name_or_id(pol, "name", &src_id), &unscoped);
+        warn_dropped_scopes(resource_type, &name, &unscoped);
         let result = client.post(endpoint, &body).await?;
         let tgt_id = tgt_id_from(&result, &format!("{resource_type} '{src_id}'"))?;
         mapper.register(resource_type, &src_id, &tgt_id);
@@ -563,6 +636,7 @@ async fn import_runtime_profiles(
     client: &KcsClient,
     bundle: &Path,
     mapper: &mut IdMapper,
+    translator: Translator,
 ) -> Result<()> {
     let profiles = read_json(&bundle.join("policies/runtime-profiles.json"))?;
     let arr = match profiles.as_array() {
@@ -577,6 +651,13 @@ async fn import_runtime_profiles(
         };
         let name = name_or_id(profile, "name", &src_id).to_string();
         let mut body = strip(profile);
+        report_translation(
+            translator,
+            Resource::RuntimeProfile,
+            &mut body,
+            "runtime profile",
+            &name,
+        );
         let unscoped = remap_system_scopes(&mut body, mapper);
         warn_dropped_scopes("runtime profile", &name, &unscoped);
         let result = client.post("/policies/runtime-profile", &body).await?;
@@ -916,6 +997,32 @@ pub async fn import_bundle(
     bundle: &Path,
     options: &ImportOptions,
 ) -> Result<IdMapper> {
+    // First, and before any request: a directory with no manifest is an
+    // interrupted export, and a bundle newer than the target cannot be replayed.
+    // Both are refused here so a doomed import writes nothing at all.
+    let manifest = Manifest::read(bundle)?;
+    let translator = Translator::new(
+        manifest.api_version,
+        client.api_version(),
+        manifest.kcs_version,
+        options.target_kcs,
+    )?;
+
+    if manifest.is_legacy() {
+        eprintln!(
+            "Note: this bundle is format {} (written by kcs-migrator {}), which did not \
+             record an API generation; treating it as APIv1.",
+            manifest.bundle_format, manifest.tool_version
+        );
+    }
+    if !translator.is_noop() {
+        eprintln!(
+            "Translating bundle bodies from API{} to API{}.",
+            manifest.api_version.prefix().trim_start_matches('/'),
+            client.api_version().prefix().trim_start_matches('/')
+        );
+    }
+
     let mut mapper = IdMapper::new();
 
     import_reports_storage(client, bundle).await?;
@@ -928,26 +1035,34 @@ pub async fn import_bundle(
     import_sso(client, bundle).await?;
     import_llm(client, bundle).await?;
     import_image_registries(client, bundle, &mut mapper).await?;
-    import_agent_groups(client, bundle, &mut mapper).await?;
+    import_agent_groups(client, bundle, &mut mapper, translator).await?;
     import_simple_policy_collection(
         client,
         bundle,
-        "policies/scanner.json",
-        "/policies/scanner",
-        "scanner-policy",
+        &PolicyCollection {
+            file_rel: "policies/scanner.json",
+            endpoint: "/policies/scanner",
+            resource_type: "scanner-policy",
+            resource: Resource::ScannerPolicy,
+        },
         &mut mapper,
+        translator,
     )
     .await?;
     import_simple_policy_collection(
         client,
         bundle,
-        "policies/assurance.json",
-        "/policies/assurance",
-        "assurance-policy",
+        &PolicyCollection {
+            file_rel: "policies/assurance.json",
+            endpoint: "/policies/assurance",
+            resource_type: "assurance-policy",
+            resource: Resource::AssurancePolicy,
+        },
         &mut mapper,
+        translator,
     )
     .await?;
-    import_runtime_profiles(client, bundle, &mut mapper).await?;
+    import_runtime_profiles(client, bundle, &mut mapper, translator).await?;
     import_runtime_policies(client, bundle, &mut mapper).await?;
     warn_notifications_reference(bundle)?;
     import_response_policies(client, bundle, &mut mapper, options.strict_notifications).await?;
@@ -1109,6 +1224,7 @@ mod tests {
         // Strict mode is what aborts now; the default drops the channel and warns.
         let strict = ImportOptions {
             strict_notifications: true,
+            ..ImportOptions::default()
         };
         let tmp = tempfile::tempdir()?;
         let bundle = make_bundle(&tmp)?;
@@ -1405,6 +1521,7 @@ mod tests {
         )?;
         let options = ImportOptions {
             strict_notifications: true,
+            ..ImportOptions::default()
         };
         let err = import_bundle(&client, &bundle, &options)
             .await
@@ -1666,6 +1783,347 @@ mod tests {
             .filter(|r| r.url.path() == "/v1/policies/runtime-profile")
             .count();
         assert_eq!(posts, 1, "the id-less entry is skipped, not sent");
+        Ok(())
+    }
+
+    // ---- group 7: the manifest gates the import ----
+
+    /// Overwrites a bundle's manifest with `raw`.
+    fn set_manifest(bundle: &std::path::Path, raw: &Value) -> Result<()> {
+        std::fs::write(bundle.join("manifest.json"), serde_json::to_string(raw)?)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_bundle_with_no_manifest_is_refused_before_any_request() -> Result<()> {
+        // The manifest is written last, so its absence means the export was
+        // interrupted. Replaying a partial bundle would write a partial
+        // configuration and report success.
+        let tmp = tempfile::tempdir()?;
+        let bundle = make_bundle(&tmp)?;
+        std::fs::remove_file(bundle.join("manifest.json"))?;
+
+        let server = MockServer::start().await;
+        let client = KcsClient::new(
+            &server.uri(),
+            "tok",
+            true,
+            None,
+            ApiVersion::V1,
+            Timeouts::default(),
+        )?;
+        let err = import_bundle(&client, &bundle, &ImportOptions::default())
+            .await
+            .expect_err("a manifest-less directory must be refused");
+        assert!(format!("{err}").contains("not a complete bundle"));
+        assert!(
+            server
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .is_empty(),
+            "nothing may be sent to the target before the bundle is accepted"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_v3_bundle_into_a_v1_target_is_refused_before_any_request() -> Result<()> {
+        // The downgrade check lives in Translator::new, which import_bundle calls
+        // before step 1. This is the test that proves "aborts with zero side
+        // effects" rather than asserting it in a doc comment.
+        let tmp = tempfile::tempdir()?;
+        let bundle = make_bundle(&tmp)?;
+        set_manifest(
+            &bundle,
+            &json!({
+                "tool_version": "0.2.0",
+                "bundle_format": 2,
+                "api_version": "v3",
+                "kcs_version": "2.5.0",
+            }),
+        )?;
+
+        let server = MockServer::start().await;
+        let client = KcsClient::new(
+            &server.uri(),
+            "tok",
+            true,
+            None,
+            ApiVersion::V1,
+            Timeouts::default(),
+        )?;
+        let options = ImportOptions {
+            target_kcs: Some(KcsVersion::new(2, 4, 1)),
+            ..ImportOptions::default()
+        };
+        let err = import_bundle(&client, &bundle, &options)
+            .await
+            .expect_err("a downgrade must be refused");
+
+        let rendered = format!("{err}");
+        assert!(rendered.contains("KCS 2.5.0"), "names the bundle release");
+        assert!(rendered.contains("KCS 2.4.1"), "names the target release");
+        assert!(
+            server
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .is_empty(),
+            "a refused downgrade must leave the target completely untouched, got {} \
+             request(s)",
+            server.received_requests().await.unwrap_or_default().len()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_format_1_bundle_still_imports_as_v1() -> Result<()> {
+        // Exactly what 0.1.0 wrote: no bundle_format, no api_version.
+        let tmp = tempfile::tempdir()?;
+        let bundle = make_bundle(&tmp)?;
+        set_manifest(
+            &bundle,
+            &json!({"tool_version": "0.1.0", "timestamp": "2026-05-21_16-58-53"}),
+        )?;
+
+        let server = MockServer::start().await;
+        let client = KcsClient::new(
+            &server.uri(),
+            "tok",
+            true,
+            None,
+            ApiVersion::V1,
+            Timeouts::default(),
+        )?;
+        import_bundle(&client, &bundle, &ImportOptions::default()).await?;
+        Ok(())
+    }
+
+    // ---- group 7: a v1 bundle is actually translated on the way to a v3 target ----
+
+    #[tokio::test]
+    async fn a_v1_assurance_policy_is_translated_before_it_is_posted() -> Result<()> {
+        // The end-to-end claim: translate.rs is wired in, not merely present.
+        // Without this the bundle's failCICDStep reaches a v3 endpoint that wants
+        // failExternalScansStep, and the field is ignored -- silently losing the
+        // setting with a 201 in reply.
+        let tmp = tempfile::tempdir()?;
+        let bundle = make_bundle(&tmp)?;
+        set_manifest(
+            &bundle,
+            &json!({
+                "tool_version": "0.2.0",
+                "bundle_format": 2,
+                "api_version": "v1",
+                "kcs_version": "2.4.1",
+            }),
+        )?;
+        std::fs::write(
+            bundle.join("policies/assurance.json"),
+            serde_json::to_string(&json!([{
+                "id": "src-pol",
+                "name": "block-criticals",
+                "failCICDStep": true,
+                "customControls": [{"id": "c1"}],
+            }]))?,
+        )?;
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v3/policies/assurance"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({"id": "t"})))
+            .mount(&server)
+            .await;
+
+        // A V3 client against a V1 bundle: the only combination that translates.
+        let client = KcsClient::new(
+            &server.uri(),
+            "tok",
+            true,
+            None,
+            ApiVersion::V3,
+            Timeouts::default(),
+        )?;
+        let options = ImportOptions {
+            target_kcs: Some(KcsVersion::new(2, 5, 0)),
+            ..ImportOptions::default()
+        };
+        import_bundle(&client, &bundle, &options).await?;
+
+        let seen = server.received_requests().await.unwrap_or_default();
+        let body: Value = seen
+            .iter()
+            .find(|r| r.url.path() == "/v3/policies/assurance")
+            .map(|r| serde_json::from_slice(&r.body))
+            .transpose()?
+            .ok_or_else(|| anyhow!("the assurance policy should have been POSTed"))?;
+
+        assert_eq!(body["failExternalScansStep"], json!(true), "renamed");
+        assert!(
+            body.get("failCICDStep").is_none(),
+            "old spelling must be gone"
+        );
+        assert!(
+            body.get("customControls").is_none(),
+            "inline custom controls became their own resource in 2.5"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_v1_runtime_profile_has_its_audit_typos_fixed_before_posting() -> Result<()> {
+        // The nested rename, end to end. It depends on fileOperationsRules being
+        // in the bundle at all, which is why group 6 switched this class to the
+        // per-item detail fetch -- the list projection omits it.
+        let tmp = tempfile::tempdir()?;
+        let bundle = make_bundle(&tmp)?;
+        set_manifest(
+            &bundle,
+            &json!({"bundle_format": 2, "api_version": "v1", "kcs_version": "2.4.1"}),
+        )?;
+        std::fs::write(
+            bundle.join("policies/runtime-profiles.json"),
+            serde_json::to_string(&json!([{
+                "id": "src-prof",
+                "name": "busybox",
+                "fileOperationsRules": {"items": [{
+                    "paths": ["/etc"],
+                    "auditEvents": {"auditWritEvents": true, "auditRenameOrEvents": true},
+                }]},
+            }]))?,
+        )?;
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v3/policies/runtime-profile"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({"id": "t"})))
+            .mount(&server)
+            .await;
+
+        let client = KcsClient::new(
+            &server.uri(),
+            "tok",
+            true,
+            None,
+            ApiVersion::V3,
+            Timeouts::default(),
+        )?;
+        import_bundle(&client, &bundle, &ImportOptions::default()).await?;
+
+        let seen = server.received_requests().await.unwrap_or_default();
+        let body: Value = seen
+            .iter()
+            .find(|r| r.url.path() == "/v3/policies/runtime-profile")
+            .map(|r| serde_json::from_slice(&r.body))
+            .transpose()?
+            .ok_or_else(|| anyhow!("the runtime profile should have been POSTed"))?;
+
+        let events = &body["fileOperationsRules"]["items"][0]["auditEvents"];
+        assert_eq!(events["auditWriteEvents"], json!(true));
+        assert_eq!(events["auditRenameOrMoveEvents"], json!(true));
+        assert!(events.get("auditWritEvents").is_none());
+        assert!(events.get("auditRenameOrEvents").is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_v3_bundle_into_a_v3_target_is_sent_unchanged() -> Result<()> {
+        // Same-generation import must be the identity. A v3 bundle already uses
+        // the new spellings, so translating again would corrupt it.
+        let tmp = tempfile::tempdir()?;
+        let bundle = make_bundle(&tmp)?;
+        set_manifest(
+            &bundle,
+            &json!({"bundle_format": 2, "api_version": "v3", "kcs_version": "2.5.0"}),
+        )?;
+        std::fs::write(
+            bundle.join("policies/assurance.json"),
+            serde_json::to_string(&json!([{
+                "id": "p", "name": "a", "failExternalScansStep": true,
+            }]))?,
+        )?;
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v3/policies/assurance"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({"id": "t"})))
+            .mount(&server)
+            .await;
+
+        let client = KcsClient::new(
+            &server.uri(),
+            "tok",
+            true,
+            None,
+            ApiVersion::V3,
+            Timeouts::default(),
+        )?;
+        import_bundle(&client, &bundle, &ImportOptions::default()).await?;
+
+        let seen = server.received_requests().await.unwrap_or_default();
+        let body: Value = seen
+            .iter()
+            .find(|r| r.url.path() == "/v3/policies/assurance")
+            .map(|r| serde_json::from_slice(&r.body))
+            .transpose()?
+            .ok_or_else(|| anyhow!("the assurance policy should have been POSTed"))?;
+        assert_eq!(body["failExternalScansStep"], json!(true));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_v1_agent_group_is_translated_before_it_is_posted() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let bundle = make_bundle(&tmp)?;
+        set_manifest(
+            &bundle,
+            &json!({"bundle_format": 2, "api_version": "v1", "kcs_version": "2.4.1"}),
+        )?;
+        std::fs::write(
+            bundle.join("integrations/agent-groups.json"),
+            serde_json::to_string(&json!([{
+                "id": "src-g",
+                "groupName": "k8s",
+                "fileThreatProtectionProxyUrl": "http://proxy.example.invalid:3128",
+                "networkReputationSource": "kcs-list",
+                "fileThreatProtectionMalwareDbUrl": "https://db.example.invalid",
+            }]))?,
+        )?;
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v3/integrations/agent-group"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({"id": "tgt-g"})))
+            .mount(&server)
+            .await;
+
+        let client = KcsClient::new(
+            &server.uri(),
+            "tok",
+            true,
+            None,
+            ApiVersion::V3,
+            Timeouts::default(),
+        )?;
+        import_bundle(&client, &bundle, &ImportOptions::default()).await?;
+
+        let seen = server.received_requests().await.unwrap_or_default();
+        let body: Value = seen
+            .iter()
+            .find(|r| r.url.path() == "/v3/integrations/agent-group")
+            .map(|r| serde_json::from_slice(&r.body))
+            .transpose()?
+            .ok_or_else(|| anyhow!("the agent group should have been POSTed"))?;
+
+        assert_eq!(
+            body["networkSettingsProxyUrl"],
+            json!("http://proxy.example.invalid:3128")
+        );
+        assert_eq!(body["networkSettingsSource"], json!("kcs-list"));
+        assert!(body.get("fileThreatProtectionProxyUrl").is_none());
+        assert!(body.get("networkReputationSource").is_none());
+        assert!(body.get("fileThreatProtectionMalwareDbUrl").is_none());
         Ok(())
     }
 }

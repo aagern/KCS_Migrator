@@ -10,7 +10,14 @@
 )]
 #![cfg_attr(
     test,
-    allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        // Tests assert by panicking; a non-exhaustive match arm that should never be
+        // reached is clearer as `panic!` than as a contrived fallback value.
+        clippy::panic
+    )
 )]
 // pedantic; `version::KcsVersion` and `client::KcsClient` read better than `version::Kcs`:
 #![allow(clippy::module_name_repetitions)]
@@ -42,6 +49,15 @@
 //! | [`importer`]  | Replays a bundle onto a target KCS in dependency order. |
 //! | [`id_mapper`] | Source→target ID registry used during import to rewrite FK fields. |
 //! | [`users`]     | Reference-only user export via `kubectl exec` against the KCS Postgres pod. |
+//! | [`version`]   | Which API generation an instance speaks, and how to tell from its release. |
+//!
+//! # API generations
+//!
+//! KCS serves several API generations side by side. KCS 2.4 and earlier
+//! only have `/api/v1/`; 2.5 added `/api/v3/` and keeps `v1` as a
+//! compatibility shim; 2.6 deprecates `v1`. The migrator detects the
+//! target's release from `GET /{v}/healthz` and picks a generation —
+//! see [`version::ApiVersion::for_kcs`].
 //!
 //! # Examples
 //!
@@ -65,3 +81,4 @@ pub mod export;
 pub mod id_mapper;
 pub mod importer;
 pub mod users;
+pub mod version;

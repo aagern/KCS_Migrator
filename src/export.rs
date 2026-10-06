@@ -17,6 +17,7 @@
 //! `get_list` directly.
 
 use crate::bundle::Manifest;
+use crate::cel;
 use crate::client::{is_client_error, KcsClient};
 use crate::version::KcsVersion;
 use anyhow::{anyhow, Result};
@@ -210,6 +211,11 @@ pub async fn export_all(
     export_notifications_reference(client, &bundle).await?;
     export_policies(client, &bundle).await?;
     export_network_reputation(client, &bundle).await?;
+    export_siem_and_external_groups(client, &bundle).await?;
+    export_benchmark(client, &bundle).await?;
+    export_assurance_controls(client, &bundle).await?;
+    export_admission_controller(client, &bundle).await?;
+    export_custom_reputation(client, &bundle).await?;
     export_components(client, &bundle).await?;
     export_config(client, &bundle).await?;
     export_security_scopes(client, &bundle).await?;
@@ -451,6 +457,173 @@ async fn export_config(client: &KcsClient, bundle: &Path) -> Result<()> {
         &bundle.join("config/reports-storage.json"),
         &reports_storage,
     )?;
+    Ok(())
+}
+
+/// Entries a preset-aware export keeps for reference but never replays.
+///
+/// KCS ships built-in benchmark frameworks (Kubernetes, MITRE, NSA) and
+/// their controls. They exist on every instance already, so re-creating
+/// them on the target would either fail or duplicate what is there. A
+/// preset is marked `isDefault: true` on a control and
+/// `isDeletable: false` on a framework.
+fn is_preset(item: &Value) -> bool {
+    item.get("isDefault").and_then(Value::as_bool) == Some(true)
+        || item.get("isDeletable").and_then(Value::as_bool) == Some(false)
+}
+
+/// Splits a list into `(custom, preset_count)`.
+///
+/// Only the custom entries are replayable, but the preset count is worth
+/// reporting: an operator who created no custom controls should see that
+/// the exporter looked, rather than wonder whether it ran.
+fn partition_presets(list: &Value) -> (Value, usize) {
+    let Some(items) = list.as_array() else {
+        return (json!([]), 0);
+    };
+    let mut custom = Vec::new();
+    let mut presets = 0;
+    for item in items {
+        if is_preset(item) {
+            presets += 1;
+        } else {
+            custom.push(item.clone());
+        }
+    }
+    (Value::Array(custom), presets)
+}
+
+/// # Overview
+///
+/// Dumps the `benchmark/` section: custom compliance frameworks and the
+/// custom controls they are built from, both new in KCS 2.5.
+///
+/// Controls carry their check as a CEL expression in a `rule` field, which
+/// [`cel::extract`] moves into `CEL/benchmark/control/<slug>.cel` so it can
+/// be read and edited before import.
+///
+/// Built-in frameworks and controls are counted and dropped rather than
+/// written: they exist on every instance, so replaying them would fail or
+/// duplicate.
+///
+/// # Errors
+///
+/// Returns the first transport, parse, or filesystem error.
+async fn export_benchmark(client: &KcsClient, bundle: &Path) -> Result<()> {
+    let controls = get_list_detailed(client, "/benchmark/control", "/benchmark/control").await?;
+    let (mut custom_controls, preset_controls) = partition_presets(&controls);
+    let extracted = cel::extract(&mut custom_controls, bundle, "benchmark/control")?;
+    write_json(&bundle.join("benchmark/controls.json"), &custom_controls)?;
+
+    let frameworks =
+        get_list_detailed(client, "/benchmark/framework", "/benchmark/framework").await?;
+    let (custom_frameworks, preset_frameworks) = partition_presets(&frameworks);
+    write_json(
+        &bundle.join("benchmark/frameworks.json"),
+        &custom_frameworks,
+    )?;
+
+    if preset_controls > 0 || preset_frameworks > 0 {
+        eprintln!(
+            "Note: skipped {preset_frameworks} built-in benchmark framework(s) and \
+             {preset_controls} built-in control(s); they exist on every instance and are \
+             not replayed. Exported {} custom control(s), {extracted} with a CEL rule.",
+            custom_controls.as_array().map_or(0, Vec::len)
+        );
+    }
+    Ok(())
+}
+
+/// # Overview
+///
+/// Dumps the custom assurance controls introduced in KCS 2.5
+/// (`/policies/assurance-control`), with their CEL rules extracted to
+/// `CEL/policies/assurance-control/`.
+///
+/// # Errors
+///
+/// Returns the first transport, parse, or filesystem error.
+async fn export_assurance_controls(client: &KcsClient, bundle: &Path) -> Result<()> {
+    let mut controls = get_list(client, "/policies/assurance-control").await?;
+    cel::extract(&mut controls, bundle, "policies/assurance-control")?;
+    write_json(&bundle.join("policies/assurance-controls.json"), &controls)?;
+    Ok(())
+}
+
+/// # Overview
+///
+/// Dumps admission-controller policies and their custom controls.
+///
+/// This is the resource that did not exist in the migrator before: in
+/// `APIv3` the admission controls left runtime policies and became
+/// `/policies/admission-controller`. A 2.5-to-2.5 migration previously
+/// dropped all admission control silently, because the exporter never
+/// looked at it.
+///
+/// The custom controls carry CEL rules, extracted to
+/// `CEL/policies/admission-controller/control/`.
+///
+/// # Errors
+///
+/// Returns the first transport, parse, or filesystem error.
+async fn export_admission_controller(client: &KcsClient, bundle: &Path) -> Result<()> {
+    let mut controls = get_list(client, "/policies/admission-controller/control").await?;
+    cel::extract(
+        &mut controls,
+        bundle,
+        "policies/admission-controller/control",
+    )?;
+    write_json(&bundle.join("policies/admission-controls.json"), &controls)?;
+
+    let policies = get_list_detailed(
+        client,
+        "/policies/admission-controller",
+        "/policies/admission-controller",
+    )
+    .await?;
+    write_json(
+        &bundle.join("policies/admission-controller.json"),
+        &policies,
+    )?;
+    Ok(())
+}
+
+/// # Overview
+///
+/// Dumps the custom-reputation list state (`/policies/custom-reputation`).
+///
+/// The list's *entries* travel as the opaque blob in
+/// [`export_network_reputation`]; this records which list is active, which
+/// the blob does not carry.
+///
+/// # Errors
+///
+/// Returns the first transport, parse, or filesystem error.
+async fn export_custom_reputation(client: &KcsClient, bundle: &Path) -> Result<()> {
+    let state = get_single(client, "/policies/custom-reputation").await?;
+    write_json(&bundle.join("policies/custom-reputation.json"), &state)?;
+    Ok(())
+}
+
+/// # Overview
+///
+/// Dumps SIEM integrations (`/integrations/siem`) and external scan groups
+/// (`/integrations/external-group`).
+///
+/// SIEM has a full CRUD API in both generations, contrary to the README's
+/// claim that SIEM is configurable only through Helm values. Its POST body
+/// is `address`, `port`, `protocol`, `exportedData` and `name` — no
+/// credentials — so unlike image registries it replays cleanly.
+///
+/// # Errors
+///
+/// Returns the first transport, parse, or filesystem error.
+async fn export_siem_and_external_groups(client: &KcsClient, bundle: &Path) -> Result<()> {
+    let siem = get_list_detailed(client, "/integrations/siem", "/integrations/siem").await?;
+    write_json(&bundle.join("integrations/siem.json"), &siem)?;
+
+    let external = get_list(client, "/integrations/external-group").await?;
+    write_json(&bundle.join("integrations/external-groups.json"), &external)?;
     Ok(())
 }
 
@@ -779,7 +952,7 @@ mod tests {
     async fn policy_export_composes_per_item_detail_not_the_list_projection() -> Result<()> {
         // The list projection drops fields POST requires. A runtime profile's
         // fileOperationsRules is the clearest case: absent from the list, so the
-        // profile both failed to import and skipped the APIv3 audit-event rename
+        // profile both failed to import and skipped the `APIv3` audit-event rename
         // that depends on walking those rules.
         let server = MockServer::start().await;
         Mock::given(method("GET"))

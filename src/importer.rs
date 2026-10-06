@@ -5,22 +5,39 @@
 //! resource onto a target KCS in a fixed dependency order so that
 //! cross-resource references can be rewritten as new IDs are minted.
 //!
-//! Pipeline order (each step is its own private helper):
+//! Pipeline order (each step is its own private helper). Dependencies
+//! first: whatever owns an ID comes before whatever references it.
 //!
-//! 1. `reports-storage` config
-//! 2. `scanner-priority`
-//! 3. `LDAP` integration
-//! 4. `SSO` integration
-//! 5. `LLM` integration
-//! 6. Image registries        (registers IDs, graceful-skips HTTP 400)
-//! 7. Agent groups            (registers IDs, graceful-skips HTTP 400)
-//! 8. Scanner policies        (registers IDs, enables if active)
-//! 9. Assurance policies      (registers IDs, enables if active)
-//! 10. Runtime profiles       (registers IDs)
-//! 11. Runtime policies       (rewrites `runtimeProfileId` via mapper)
-//! 12. Notifications warning  (cannot be replayed; emits operator notice)
-//! 13. Response policies      (rewrites `notificationSettingsIds`)
-//! 14. Network reputation     (binary blob upload)
+//! ```text
+//!  1  reports-storage config
+//!  2  scanner priority
+//!  3  security scopes            read-only; matches bundle scopes to the target by name
+//!  4  LDAP                       POST + /{id}/enable
+//!  5  SSO
+//!  6  LLM
+//!  7  SIEM integrations
+//!  8  image registries           registers IDs; 400 -> skip + warn
+//!  9  external scan groups
+//! 10  agent groups               translated; registers IDs; 400 -> skip + warn
+//! 11  benchmark controls         v3 only; CEL rules inlined from CEL/
+//! 12  benchmark frameworks       v3 only; + /{id}/enable
+//! 13  assurance controls         v3 only; CEL rules inlined
+//! 14  scanner policies           + /{id}/enable
+//! 15  assurance policies         translated; + /{id}/enable
+//! 16  admission controls         v3 only; CEL rules inlined
+//! 17  admission-controller policies   v3 only
+//! 18  runtime profiles           translated; registers IDs
+//! 19  runtime policies           rewrites runtimeProfileId; splits off an
+//!                                admission policy when the bundle is `APIv1`
+//! 20  notification channels      warning only, no create endpoint exists
+//! 21  response policies          unmappable channels dropped + warned
+//! 22  custom-reputation list selection
+//! 23  network-reputation blob
+//! ```
+//!
+//! Steps 11-13 and 16-17 are the resource classes KCS 2.5 introduced. On an
+//! `APIv1` target they are skipped without a request, because 2.4 has no route
+//! for them and a 404 would abort the import.
 //!
 //! Some resources cannot be replayed even with a complete body — image
 //! registries with credential-based auth, agent groups with a
@@ -30,10 +47,11 @@
 //! strict-error contract for genuine bugs.
 
 use crate::bundle::Manifest;
+use crate::cel;
 use crate::client::{error_status, KcsClient};
 use crate::id_mapper::IdMapper;
 use crate::translate::{Resource, Translator};
-use crate::version::KcsVersion;
+use crate::version::{ApiVersion, KcsVersion};
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
 use std::path::Path;
@@ -337,6 +355,158 @@ fn remap_system_scopes(body: &mut Value, mapper: &IdMapper) -> Vec<String> {
     stale
 }
 
+/// Replays a flat collection: read the file, optionally inline CEL rules,
+/// translate, remap scopes, POST each entry, register the new ID.
+///
+/// Returns the number of entries created. Factored out because the six
+/// resources added for KCS 2.5 differ only in their file, endpoint and
+/// mapper key — writing six near-identical loops is how the LDAP and
+/// scope bugs got in, each a copy that drifted from its neighbours.
+///
+/// # Errors
+///
+/// Any POST failure aborts the import, except the 404 that means the
+/// target does not serve this resource at all.
+async fn import_collection(
+    client: &KcsClient,
+    bundle: &Path,
+    collection: &PolicyCollection<'_>,
+    mapper: &mut IdMapper,
+    translator: Translator,
+) -> Result<usize> {
+    let PolicyCollection {
+        file_rel,
+        endpoint,
+        resource_type,
+        resource,
+        has_cel,
+        graceful_400,
+    } = *collection;
+
+    let path = bundle.join(file_rel);
+    if !path.exists() {
+        // A format-1 bundle has none of these files. Their absence is not an
+        // error; it means the source predates the resource.
+        return Ok(0);
+    }
+    let mut items = read_json(&path)?;
+    if has_cel {
+        // Must happen before the POST: the API wants the rule inline, and the
+        // bundle stores it as a pointer to an editable .cel file.
+        cel::inline(&mut items, bundle)?;
+    }
+
+    let Some(arr) = items.as_array().cloned() else {
+        return Ok(0);
+    };
+    let mut created = 0;
+
+    for item in &arr {
+        let Some(src_id) = src_id_from(item) else {
+            warn_skipped_without_id(resource_type, item);
+            continue;
+        };
+        let name = name_or_id(item, "name", &src_id).to_string();
+        let enabled = item["enabled"].as_bool().unwrap_or(false);
+
+        let mut body = strip(item);
+        report_translation(translator, resource, &mut body, resource_type, &name);
+        let unscoped = remap_system_scopes(&mut body, mapper);
+        warn_dropped_scopes(resource_type, &name, &unscoped);
+
+        match client.post(endpoint, &body).await {
+            Ok(result) => {
+                let tgt_id = tgt_id_from(&result, &format!("{resource_type} '{name}'"))?;
+                mapper.register(resource_type, &src_id, &tgt_id);
+                created += 1;
+                if enabled {
+                    enable_policy(client, endpoint, &tgt_id).await?;
+                }
+            }
+            // Same contract as image registries, where it applies: a 400 means
+            // this one entry cannot be replayed, not that the import is broken.
+            Err(e) if graceful_400 && is_bad_request(&e) => {
+                eprintln!(
+                    "OPERATOR ACTION REQUIRED: {resource_type} '{name}' was not imported \
+                     (HTTP 400). Recreate it in the target console."
+                );
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(created)
+}
+
+/// Replays the KCS 2.5 resource classes, or reports them skipped.
+///
+/// An `APIv1` target has no route for any of these, and a 404 is not a
+/// graceful-skip status, so attempting one would abort the whole import.
+/// The entries stay in the bundle either way.
+async fn import_or_skip_v3_only(
+    client: &KcsClient,
+    bundle: &Path,
+    group: &[PolicyCollection<'_>],
+    mapper: &mut IdMapper,
+    translator: Translator,
+    target_is_v3: bool,
+) -> Result<()> {
+    for collection in group {
+        if target_is_v3 {
+            import_collection(client, bundle, collection, mapper, translator).await?;
+        } else {
+            note_v3_only_skip(
+                collection.resource_type,
+                count_entries(bundle, collection.file_rel),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Reports a v3-only resource class skipped because the target is `APIv1`.
+fn note_v3_only_skip(kind: &str, count: usize) {
+    if count == 0 {
+        return;
+    }
+    eprintln!(
+        "Note: skipping {count} {kind} — this target speaks APIv1 (KCS 2.4 or earlier), \
+         which has no equivalent resource. They remain in the bundle."
+    );
+}
+
+/// Counts the entries in a bundle collection file, for the skip notice.
+fn count_entries(bundle: &Path, file_rel: &str) -> usize {
+    read_json(&bundle.join(file_rel))
+        .ok()
+        .as_ref()
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len)
+}
+
+/// Replays the custom-reputation list selection via
+/// `POST /policies/custom-reputation/toggle`.
+///
+/// The list's entries ride in the binary blob; this restores which list is
+/// active, which the blob does not carry. No-op when the bundle recorded
+/// no selection.
+async fn import_custom_reputation_toggle(client: &KcsClient, bundle: &Path) -> Result<()> {
+    let path = bundle.join("policies/custom-reputation.json");
+    if !path.exists() {
+        return Ok(());
+    }
+    let state = read_json(&path)?;
+    let Some(enabled_list) = state.get("enabledList").and_then(Value::as_str) else {
+        return Ok(());
+    };
+    client
+        .post(
+            "/policies/custom-reputation/toggle",
+            &json!({ "enabledList": enabled_list }),
+        )
+        .await?;
+    Ok(())
+}
+
 /// Replays the reports-storage configuration via
 /// `PUT /reports/storage/config`. No-op if the bundle file is empty
 /// (the source instance never configured it).
@@ -571,57 +741,109 @@ struct PolicyCollection<'a> {
     resource_type: &'a str,
     /// Which translation rules apply to this collection.
     resource: Resource,
+    /// Entries carry a CEL `rule` stored as a `$celFile` pointer, which has
+    /// to be read back inline before the POST.
+    has_cel: bool,
+    /// An HTTP 400 on one entry is a skip-with-warning rather than a hard
+    /// failure.
+    ///
+    /// True for resources whose creation can legitimately be refused —
+    /// an entry needing credentials the bundle does not hold. False for
+    /// the policy classes, where a 400 means the body is wrong and
+    /// continuing would hide it.
+    graceful_400: bool,
 }
 
-/// Replays a "simple" policy collection — one that needs no FK
-/// rewriting, just create + optional enable. Used for scanner and
-/// assurance policies, which share the same shape.
+/// The collections the pipeline replays, in dependency order.
 ///
-/// For each entry in `file_rel`: `POST endpoint` with the stripped
-/// body, register `(resource_type, src_id) → tgt_id` in `mapper`, and
-/// if the source had `enabled = true`, also `POST endpoint/<tgt_id>/enable`.
-///
-/// # Errors
-///
-/// Any POST failure (create or enable) aborts the whole import.
-async fn import_simple_policy_collection(
-    client: &KcsClient,
-    bundle: &Path,
-    collection: &PolicyCollection<'_>,
-    mapper: &mut IdMapper,
-    translator: Translator,
-) -> Result<()> {
-    let PolicyCollection {
-        file_rel,
-        endpoint,
-        resource_type,
-        resource,
-    } = *collection;
-    let policies = read_json(&bundle.join(file_rel))?;
-    let arr = match policies.as_array() {
-        Some(a) => a.clone(),
-        None => return Ok(()),
+/// Declared as constants rather than inline literals because the pipeline
+/// function hit 190 lines of struct initialisers, at which point the order
+/// — which is the actual contract — stopped being readable. Named
+/// constants let [`import_bundle`] read as the list of steps it is.
+mod collections {
+    use super::{PolicyCollection, Resource};
+
+    pub const SIEM: PolicyCollection<'static> = PolicyCollection {
+        file_rel: "integrations/siem.json",
+        endpoint: "/integrations/siem",
+        resource_type: "siem-integration",
+        resource: Resource::Siem,
+        has_cel: false,
+        graceful_400: true,
+    };
+    pub const EXTERNAL_GROUPS: PolicyCollection<'static> = PolicyCollection {
+        file_rel: "integrations/external-groups.json",
+        endpoint: "/integrations/external-group",
+        resource_type: "external-group",
+        resource: Resource::ExternalGroup,
+        has_cel: false,
+        graceful_400: true,
+    };
+    pub const BENCHMARK_CONTROLS: PolicyCollection<'static> = PolicyCollection {
+        file_rel: "benchmark/controls.json",
+        endpoint: "/benchmark/control",
+        resource_type: "benchmark-control",
+        resource: Resource::BenchmarkControl,
+        has_cel: true,
+        graceful_400: true,
+    };
+    pub const BENCHMARK_FRAMEWORKS: PolicyCollection<'static> = PolicyCollection {
+        file_rel: "benchmark/frameworks.json",
+        endpoint: "/benchmark/framework",
+        resource_type: "benchmark-framework",
+        resource: Resource::BenchmarkFramework,
+        has_cel: false,
+        graceful_400: true,
+    };
+    pub const ASSURANCE_CONTROLS: PolicyCollection<'static> = PolicyCollection {
+        file_rel: "policies/assurance-controls.json",
+        endpoint: "/policies/assurance-control",
+        resource_type: "assurance-control",
+        resource: Resource::AssuranceControl,
+        has_cel: true,
+        graceful_400: true,
+    };
+    pub const ADMISSION_CONTROLS: PolicyCollection<'static> = PolicyCollection {
+        file_rel: "policies/admission-controls.json",
+        endpoint: "/policies/admission-controller/control",
+        resource_type: "admission-control",
+        resource: Resource::AdmissionControl,
+        has_cel: true,
+        graceful_400: true,
+    };
+    pub const ADMISSION_POLICIES: PolicyCollection<'static> = PolicyCollection {
+        file_rel: "policies/admission-controller.json",
+        endpoint: "/policies/admission-controller",
+        resource_type: "admission-policy",
+        resource: Resource::AdmissionPolicy,
+        has_cel: false,
+        graceful_400: true,
+    };
+    pub const SCANNER_POLICIES: PolicyCollection<'static> = PolicyCollection {
+        file_rel: "policies/scanner.json",
+        endpoint: "/policies/scanner",
+        resource_type: "scanner-policy",
+        resource: Resource::ScannerPolicy,
+        has_cel: false,
+        // A 400 on a scanner policy means the body is wrong, not that this one
+        // entry is unreplayable. Hiding it would hide a translation bug.
+        graceful_400: false,
+    };
+    pub const ASSURANCE_POLICIES: PolicyCollection<'static> = PolicyCollection {
+        file_rel: "policies/assurance.json",
+        endpoint: "/policies/assurance",
+        resource_type: "assurance-policy",
+        resource: Resource::AssurancePolicy,
+        has_cel: false,
+        graceful_400: false,
     };
 
-    for pol in &arr {
-        let Some(src_id) = src_id_from(pol) else {
-            warn_skipped_without_id(resource_type, pol);
-            continue;
-        };
-        let enabled = pol["enabled"].as_bool().unwrap_or(false);
-        let name = name_or_id(pol, "name", &src_id).to_string();
-        let mut body = strip(pol);
-        report_translation(translator, resource, &mut body, resource_type, &name);
-        let unscoped = remap_system_scopes(&mut body, mapper);
-        warn_dropped_scopes(resource_type, &name, &unscoped);
-        let result = client.post(endpoint, &body).await?;
-        let tgt_id = tgt_id_from(&result, &format!("{resource_type} '{src_id}'"))?;
-        mapper.register(resource_type, &src_id, &tgt_id);
-        if enabled {
-            enable_policy(client, endpoint, &tgt_id).await?;
-        }
-    }
-    Ok(())
+    /// The classes KCS 2.5 introduced, which an `APIv1` target has no route for.
+    pub const V3_ONLY: &[PolicyCollection<'static>] =
+        &[BENCHMARK_CONTROLS, BENCHMARK_FRAMEWORKS, ASSURANCE_CONTROLS];
+    /// The 2.5 classes replayed after the policy classes they belong beside.
+    pub const V3_ONLY_LATE: &[PolicyCollection<'static>] =
+        &[ADMISSION_CONTROLS, ADMISSION_POLICIES];
 }
 
 /// Replays runtime profiles via `POST /policies/runtime-profile`.
@@ -682,6 +904,7 @@ async fn import_runtime_policies(
     client: &KcsClient,
     bundle: &Path,
     mapper: &mut IdMapper,
+    translator: Translator,
 ) -> Result<()> {
     let policies = read_json(&bundle.join("policies/runtime.json"))?;
     let arr = match policies.as_array() {
@@ -696,7 +919,13 @@ async fn import_runtime_policies(
         };
         let name = name_or_id(pol, "name", &src_id).to_string();
         let enabled = pol["enabled"].as_bool().unwrap_or(false);
-        let mut body = strip(pol);
+
+        // An `APIv1` policy carries its admission controls inline; `APIv3` keeps them
+        // in a separate resource. The split happens before anything is stripped or
+        // rewritten, so both halves start from the full source body.
+        let (runtime_src, admission_src) = translator.split_runtime_policy(pol);
+
+        let mut body = strip(&runtime_src);
         rewrite_runtime_profile_match_blocks(&mut body, pol, &src_id, mapper)?;
         let unscoped = remap_system_scopes(&mut body, mapper);
         warn_dropped_scopes("runtime policy", &name, &unscoped);
@@ -706,8 +935,51 @@ async fn import_runtime_policies(
         if enabled {
             enable_policy(client, "/policies/runtime", &tgt_id).await?;
         }
+
+        // The admission half, when the source had admission control in use. On a
+        // v1 target this is None, because no split happened.
+        if let Some(admission) = admission_src {
+            import_split_admission_policy(client, &admission, &name, enabled, mapper).await?;
+        }
     }
     Ok(())
+}
+
+/// Creates the admission-controller policy that split off a v1 runtime
+/// policy.
+///
+/// A failure here is reported but does not abort: the runtime half is
+/// already on the target, so aborting would leave the migration half-done
+/// with no way to resume. The operator is told which policy lost its
+/// admission controls, which is recoverable by hand; a dead import is not.
+async fn import_split_admission_policy(
+    client: &KcsClient,
+    admission: &Value,
+    name: &str,
+    enabled: bool,
+    mapper: &mut IdMapper,
+) -> Result<()> {
+    let body = strip(admission);
+    match client.post("/policies/admission-controller", &body).await {
+        Ok(result) => {
+            let tgt_id = tgt_id_from(&result, &format!("admission policy '{name}'"))?;
+            mapper.register("admission-policy-from-runtime", name, &tgt_id);
+            if enabled {
+                enable_policy(client, "/policies/admission-controller", &tgt_id).await?;
+            }
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!(
+                "OPERATOR ACTION REQUIRED: runtime policy '{name}' was imported, but the \
+                 admission-controller policy that APIv3 splits out of it was not \
+                 ({e}). Its admission controls — image checks, capability blocks, \
+                 registry allow-lists — are NOT active on the target. Recreate an \
+                 admission policy named '{name}' in the target console."
+            );
+            Ok(())
+        }
+    }
 }
 
 /// Rewrites the `runtimeProfileMatchBlocks` array on a runtime-policy
@@ -1034,38 +1306,61 @@ pub async fn import_bundle(
     import_ldap(client, bundle, &mut mapper).await?;
     import_sso(client, bundle).await?;
     import_llm(client, bundle).await?;
+    import_collection(client, bundle, &collections::SIEM, &mut mapper, translator).await?;
     import_image_registries(client, bundle, &mut mapper).await?;
-    import_agent_groups(client, bundle, &mut mapper, translator).await?;
-    import_simple_policy_collection(
+    import_collection(
         client,
         bundle,
-        &PolicyCollection {
-            file_rel: "policies/scanner.json",
-            endpoint: "/policies/scanner",
-            resource_type: "scanner-policy",
-            resource: Resource::ScannerPolicy,
-        },
+        &collections::EXTERNAL_GROUPS,
         &mut mapper,
         translator,
     )
     .await?;
-    import_simple_policy_collection(
+    import_agent_groups(client, bundle, &mut mapper, translator).await?;
+
+    // The KCS 2.5 resource classes. On an `APIv1` target they are skipped without
+    // a request: 2.4 has no route for them, and a 404 would abort the import.
+    let target_is_v3 = client.api_version() == ApiVersion::V3;
+    import_or_skip_v3_only(
         client,
         bundle,
-        &PolicyCollection {
-            file_rel: "policies/assurance.json",
-            endpoint: "/policies/assurance",
-            resource_type: "assurance-policy",
-            resource: Resource::AssurancePolicy,
-        },
+        collections::V3_ONLY,
         &mut mapper,
         translator,
+        target_is_v3,
+    )
+    .await?;
+
+    import_collection(
+        client,
+        bundle,
+        &collections::SCANNER_POLICIES,
+        &mut mapper,
+        translator,
+    )
+    .await?;
+    import_collection(
+        client,
+        bundle,
+        &collections::ASSURANCE_POLICIES,
+        &mut mapper,
+        translator,
+    )
+    .await?;
+    import_or_skip_v3_only(
+        client,
+        bundle,
+        collections::V3_ONLY_LATE,
+        &mut mapper,
+        translator,
+        target_is_v3,
     )
     .await?;
     import_runtime_profiles(client, bundle, &mut mapper, translator).await?;
-    import_runtime_policies(client, bundle, &mut mapper).await?;
+    import_runtime_policies(client, bundle, &mut mapper, translator).await?;
     warn_notifications_reference(bundle)?;
     import_response_policies(client, bundle, &mut mapper, options.strict_notifications).await?;
+    import_custom_reputation_toggle(client, bundle).await?;
     import_network_reputation(client, bundle).await?;
 
     Ok(mapper)
@@ -2124,6 +2419,492 @@ mod tests {
         assert!(body.get("fileThreatProtectionProxyUrl").is_none());
         assert!(body.get("networkReputationSource").is_none());
         assert!(body.get("fileThreatProtectionMalwareDbUrl").is_none());
+        Ok(())
+    }
+
+    // ---- group 8: the six new resources ----
+
+    /// Mounts a POST that returns a fresh id, for each path given.
+    async fn mount_creates(server: &MockServer, paths: &[(&str, &str)]) {
+        for (p, id) in paths {
+            Mock::given(method("POST"))
+                .and(path(*p))
+                .respond_with(ResponseTemplate::new(201).set_body_json(json!({"id": *id})))
+                .mount(server)
+                .await;
+        }
+    }
+
+    /// A format-2 v3 bundle, so the new resource classes are in scope.
+    fn make_v3_bundle(tmp: &tempfile::TempDir) -> Result<std::path::PathBuf> {
+        let bundle = make_bundle(tmp)?;
+        set_manifest(
+            &bundle,
+            &json!({
+                "tool_version": "0.2.0",
+                "bundle_format": 2,
+                "api_version": "v3",
+                "kcs_version": "2.5.0",
+            }),
+        )?;
+        Ok(bundle)
+    }
+
+    fn v3_client(uri: &str) -> Result<KcsClient> {
+        KcsClient::new(uri, "tok", true, None, ApiVersion::V3, Timeouts::default())
+    }
+
+    #[tokio::test]
+    async fn siem_integrations_are_imported() -> Result<()> {
+        // The README claimed SIEM was Helm-values-only. It has a full CRUD API in
+        // both generations, and its POST body carries no credentials, so unlike
+        // image registries it replays cleanly.
+        let tmp = tempfile::tempdir()?;
+        let bundle = make_v3_bundle(&tmp)?;
+        std::fs::write(
+            bundle.join("integrations/siem.json"),
+            serde_json::to_string(&json!([{
+                "id": "src-siem",
+                "name": "corp-splunk",
+                "address": "siem.example.invalid",
+                "port": 514,
+                "protocol": "tcp",
+                "exportedData": ["vulnerabilities", "runtime"],
+            }]))?,
+        )?;
+
+        let server = MockServer::start().await;
+        mount_creates(&server, &[("/v3/integrations/siem", "tgt-siem")]).await;
+        let client = v3_client(&server.uri())?;
+        let mapper = import_bundle(&client, &bundle, &ImportOptions::default()).await?;
+
+        assert_eq!(mapper.resolve("siem-integration", "src-siem")?, "tgt-siem");
+        let seen = server.received_requests().await.unwrap_or_default();
+        let body: Value = seen
+            .iter()
+            .find(|r| r.url.path() == "/v3/integrations/siem")
+            .map(|r| serde_json::from_slice(&r.body))
+            .transpose()?
+            .ok_or_else(|| anyhow!("SIEM should have been POSTed"))?;
+        assert_eq!(body["address"], json!("siem.example.invalid"));
+        assert_eq!(body["port"], json!(514));
+        assert_eq!(body["exportedData"][1], json!("runtime"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn external_groups_are_imported() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let bundle = make_v3_bundle(&tmp)?;
+        std::fs::write(
+            bundle.join("integrations/external-groups.json"),
+            serde_json::to_string(&json!([{
+                "id": "src-eg", "groupName": "ci-runners", "description": "CI",
+            }]))?,
+        )?;
+
+        let server = MockServer::start().await;
+        mount_creates(&server, &[("/v3/integrations/external-group", "tgt-eg")]).await;
+        let client = v3_client(&server.uri())?;
+        let mapper = import_bundle(&client, &bundle, &ImportOptions::default()).await?;
+        assert_eq!(mapper.resolve("external-group", "src-eg")?, "tgt-eg");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_cel_rule_is_inlined_from_its_file_before_the_post() -> Result<()> {
+        // The CEL round-trip that matters: export wrote the rule to a .cel file
+        // and left a pointer, so import has to read the file back. If it POSTed
+        // the pointer object instead, the server would reject it or store a
+        // control with no rule.
+        const RULE: &str = "object.spec.containers.all(c,\n  c.image != \"latest\"\n)";
+
+        let tmp = tempfile::tempdir()?;
+        let bundle = make_v3_bundle(&tmp)?;
+        std::fs::create_dir_all(bundle.join("CEL/benchmark/control"))?;
+        std::fs::write(bundle.join("CEL/benchmark/control/CTRL-9001.cel"), RULE)?;
+        std::fs::create_dir_all(bundle.join("benchmark"))?;
+        std::fs::write(
+            bundle.join("benchmark/controls.json"),
+            serde_json::to_string(&json!([{
+                "id": "src-ctl",
+                "controlId": "CTRL-9001",
+                "name": "no latest tag",
+                "rule": {"$celFile": "CEL/benchmark/control/CTRL-9001.cel"},
+            }]))?,
+        )?;
+
+        let server = MockServer::start().await;
+        mount_creates(&server, &[("/v3/benchmark/control", "tgt-ctl")]).await;
+        let client = v3_client(&server.uri())?;
+        import_bundle(&client, &bundle, &ImportOptions::default()).await?;
+
+        let seen = server.received_requests().await.unwrap_or_default();
+        let body: Value = seen
+            .iter()
+            .find(|r| r.url.path() == "/v3/benchmark/control")
+            .map(|r| serde_json::from_slice(&r.body))
+            .transpose()?
+            .ok_or_else(|| anyhow!("the benchmark control should have been POSTed"))?;
+        assert_eq!(
+            body["rule"],
+            json!(RULE),
+            "the rule must arrive as the inline string the API expects"
+        );
+        assert!(
+            body["rule"].get("$celFile").is_none(),
+            "the pointer must never reach the server"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_cel_pointer_that_escapes_the_bundle_aborts_the_import() -> Result<()> {
+        // A bundle is hand-editable, so this is reachable input.
+        let tmp = tempfile::tempdir()?;
+        let bundle = make_v3_bundle(&tmp)?;
+        std::fs::create_dir_all(bundle.join("benchmark"))?;
+        std::fs::write(
+            bundle.join("benchmark/controls.json"),
+            serde_json::to_string(&json!([{
+                "id": "c", "controlId": "X", "rule": {"$celFile": "../../../etc/passwd"},
+            }]))?,
+        )?;
+
+        let server = MockServer::start().await;
+        let client = v3_client(&server.uri())?;
+        let err = import_bundle(&client, &bundle, &ImportOptions::default())
+            .await
+            .expect_err("a traversing CEL pointer must abort");
+        assert!(format!("{err}").contains("escapes the bundle"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn admission_controller_policies_are_imported_and_enabled() -> Result<()> {
+        // The resource the migrator was completely blind to. A 2.5-to-2.5
+        // migration used to drop all admission control silently.
+        let tmp = tempfile::tempdir()?;
+        let bundle = make_v3_bundle(&tmp)?;
+        std::fs::write(
+            bundle.join("policies/admission-controller.json"),
+            serde_json::to_string(&json!([{
+                "id": "src-adm",
+                "name": "block-privileged",
+                "enabled": true,
+                "enforcementMode": "enforce",
+                "useCapabilityBlock": true,
+                "capabilityBlock": ["CAP_SYS_ADMIN"],
+            }]))?,
+        )?;
+
+        let server = MockServer::start().await;
+        mount_creates(&server, &[("/v3/policies/admission-controller", "tgt-adm")]).await;
+        Mock::given(method("POST"))
+            .and(path("/v3/policies/admission-controller/tgt-adm/enable"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .mount(&server)
+            .await;
+
+        let client = v3_client(&server.uri())?;
+        let mapper = import_bundle(&client, &bundle, &ImportOptions::default()).await?;
+        assert_eq!(mapper.resolve("admission-policy", "src-adm")?, "tgt-adm");
+
+        let seen = server.received_requests().await.unwrap_or_default();
+        assert!(
+            seen.iter()
+                .any(|r| r.url.path() == "/v3/policies/admission-controller/tgt-adm/enable"),
+            "an enabled source policy must be enabled on the target"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_custom_reputation_list_selection_is_restored() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let bundle = make_v3_bundle(&tmp)?;
+        std::fs::write(
+            bundle.join("policies/custom-reputation.json"),
+            serde_json::to_string(&json!({"enabledList": "kcs-list", "total": 0}))?,
+        )?;
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v3/policies/custom-reputation/toggle"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .mount(&server)
+            .await;
+
+        let client = v3_client(&server.uri())?;
+        import_bundle(&client, &bundle, &ImportOptions::default()).await?;
+
+        let seen = server.received_requests().await.unwrap_or_default();
+        let body: Value = seen
+            .iter()
+            .find(|r| r.url.path() == "/v3/policies/custom-reputation/toggle")
+            .map(|r| serde_json::from_slice(&r.body))
+            .transpose()?
+            .ok_or_else(|| anyhow!("the toggle should have been POSTed"))?;
+        assert_eq!(body["enabledList"], json!("kcs-list"));
+        Ok(())
+    }
+
+    // ---- group 8: the runtime policy split, end to end ----
+
+    #[tokio::test]
+    async fn a_v1_runtime_policy_becomes_two_v3_resources() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let bundle = make_bundle(&tmp)?;
+        set_manifest(
+            &bundle,
+            &json!({"bundle_format": 2, "api_version": "v1", "kcs_version": "2.4.1"}),
+        )?;
+        std::fs::write(
+            bundle.join("policies/runtime.json"),
+            serde_json::to_string(&json!([{
+                "id": "src-rt",
+                "name": "forensics",
+                "type": "container",
+                "enabled": true,
+                "enforcementMode": "audit",
+                "useCapabilityBlock": true,
+                "capabilityBlock": ["CAP_SYS_ADMIN"],
+                "useContainerRuntimeProfiles": true,
+                "runtimeProfileMatchBlocks": [],
+            }]))?,
+        )?;
+
+        let server = MockServer::start().await;
+        mount_creates(
+            &server,
+            &[
+                ("/v3/policies/runtime", "tgt-rt"),
+                ("/v3/policies/admission-controller", "tgt-adm"),
+            ],
+        )
+        .await;
+        for p in [
+            "/v3/policies/runtime/tgt-rt/enable",
+            "/v3/policies/admission-controller/tgt-adm/enable",
+        ] {
+            Mock::given(method("POST"))
+                .and(path(p))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+                .mount(&server)
+                .await;
+        }
+
+        let client = v3_client(&server.uri())?;
+        import_bundle(&client, &bundle, &ImportOptions::default()).await?;
+
+        let seen = server.received_requests().await.unwrap_or_default();
+        let body_at = |p: &str| -> Option<Value> {
+            seen.iter()
+                .find(|r| r.url.path() == p)
+                .and_then(|r| serde_json::from_slice(&r.body).ok())
+        };
+
+        let runtime = body_at("/v3/policies/runtime")
+            .ok_or_else(|| anyhow!("runtime half should have been POSTed"))?;
+        let admission = body_at("/v3/policies/admission-controller")
+            .ok_or_else(|| anyhow!("admission half should have been POSTed"))?;
+
+        // The admission fields left the runtime half entirely.
+        assert!(runtime.get("useCapabilityBlock").is_none());
+        assert!(runtime.get("capabilityBlock").is_none());
+        assert_eq!(runtime["useContainerRuntimeProfiles"], json!(true));
+
+        // And arrived on the admission half, with the name that pairs them.
+        assert_eq!(admission["useCapabilityBlock"], json!(true));
+        assert_eq!(admission["capabilityBlock"][0], json!("CAP_SYS_ADMIN"));
+        assert_eq!(admission["name"], json!("forensics"));
+        assert_eq!(admission["enforcementMode"], json!("audit"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_failed_admission_half_warns_but_keeps_the_import_alive() -> Result<()> {
+        // The runtime half is already on the target by then, so aborting would
+        // leave a half-done migration with no way to resume. A named warning is
+        // recoverable by hand; a dead import is not.
+        let tmp = tempfile::tempdir()?;
+        let bundle = make_bundle(&tmp)?;
+        set_manifest(
+            &bundle,
+            &json!({"bundle_format": 2, "api_version": "v1", "kcs_version": "2.4.1"}),
+        )?;
+        std::fs::write(
+            bundle.join("policies/runtime.json"),
+            serde_json::to_string(&json!([{
+                "id": "r", "name": "forensics", "useCapabilityBlock": true,
+                "capabilityBlock": ["CAP_SYS_ADMIN"],
+            }]))?,
+        )?;
+
+        let server = MockServer::start().await;
+        mount_creates(&server, &[("/v3/policies/runtime", "tgt-rt")]).await;
+        Mock::given(method("POST"))
+            .and(path("/v3/policies/admission-controller"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let client = v3_client(&server.uri())?;
+        let mapper = import_bundle(&client, &bundle, &ImportOptions::default()).await?;
+        // The import completed, and the runtime half is recorded.
+        assert_eq!(mapper.resolve("runtime-policy", "r")?, "tgt-rt");
+
+        // And the admission half was genuinely attempted. Without this the test
+        // also passes when the split is never wired at all, which is the state
+        // this group is meant to have left behind.
+        let seen = server.received_requests().await.unwrap_or_default();
+        assert!(
+            seen.iter()
+                .any(|r| r.url.path() == "/v3/policies/admission-controller"),
+            "the admission half must be attempted before it can fail gracefully"
+        );
+        // No mapping for it, since it never got an id.
+        assert_eq!(
+            mapper.resolve_opt("admission-policy-from-runtime", "forensics"),
+            None
+        );
+        Ok(())
+    }
+
+    // ---- group 8: v3-only resources are skipped on a v1 target ----
+
+    #[tokio::test]
+    async fn v3_only_resources_are_skipped_on_a_v1_target_without_a_request() -> Result<()> {
+        // KCS 2.4 has no route for these, and 404 is not a graceful-skip status,
+        // so attempting them would abort the whole import.
+        let tmp = tempfile::tempdir()?;
+        let bundle = make_bundle(&tmp)?;
+        std::fs::create_dir_all(bundle.join("benchmark"))?;
+        std::fs::write(
+            bundle.join("benchmark/controls.json"),
+            serde_json::to_string(&json!([{"id": "c", "controlId": "X", "rule": "true"}]))?,
+        )?;
+        std::fs::write(
+            bundle.join("policies/admission-controller.json"),
+            serde_json::to_string(&json!([{"id": "a", "name": "adm"}]))?,
+        )?;
+
+        let server = MockServer::start().await;
+        let client = KcsClient::new(
+            &server.uri(),
+            "tok",
+            true,
+            None,
+            ApiVersion::V1,
+            Timeouts::default(),
+        )?;
+        import_bundle(&client, &bundle, &ImportOptions::default()).await?;
+
+        let seen = server.received_requests().await.unwrap_or_default();
+        for forbidden in [
+            "/v1/benchmark/control",
+            "/v1/benchmark/framework",
+            "/v1/policies/assurance-control",
+            "/v1/policies/admission-controller",
+            "/v1/policies/admission-controller/control",
+        ] {
+            assert!(
+                !seen.iter().any(|r| r.url.path() == forbidden),
+                "{forbidden} must not be attempted against an APIv1 target"
+            );
+        }
+        Ok(())
+    }
+
+    // ---- group 8: dependency order is the contract ----
+
+    #[tokio::test]
+    async fn the_pipeline_creates_resources_in_dependency_order() -> Result<()> {
+        // The order IS the contract: a framework names its controls, an assurance
+        // policy its custom controls, a runtime policy its profiles. Nothing else
+        // in the suite would catch a reordering.
+        let tmp = tempfile::tempdir()?;
+        let bundle = make_v3_bundle(&tmp)?;
+        std::fs::create_dir_all(bundle.join("benchmark"))?;
+
+        let one = |v: Value| serde_json::to_string(&json!([v]));
+        std::fs::write(
+            bundle.join("integrations/siem.json"),
+            one(json!({"id": "s", "name": "siem"}))?,
+        )?;
+        std::fs::write(
+            bundle.join("integrations/external-groups.json"),
+            one(json!({"id": "e", "groupName": "eg"}))?,
+        )?;
+        std::fs::write(
+            bundle.join("benchmark/controls.json"),
+            one(json!({"id": "bc", "controlId": "C1"}))?,
+        )?;
+        std::fs::write(
+            bundle.join("benchmark/frameworks.json"),
+            one(json!({"id": "bf", "name": "fw"}))?,
+        )?;
+        std::fs::write(
+            bundle.join("policies/assurance-controls.json"),
+            one(json!({"id": "ac", "name": "ac"}))?,
+        )?;
+        std::fs::write(
+            bundle.join("policies/admission-controls.json"),
+            one(json!({"id": "adc", "name": "adc"}))?,
+        )?;
+        std::fs::write(
+            bundle.join("policies/admission-controller.json"),
+            one(json!({"id": "adp", "name": "adp"}))?,
+        )?;
+        std::fs::write(
+            bundle.join("policies/runtime-profiles.json"),
+            one(json!({"id": "rp", "name": "rp"}))?,
+        )?;
+
+        let server = MockServer::start().await;
+        mount_creates(
+            &server,
+            &[
+                ("/v3/integrations/siem", "t-s"),
+                ("/v3/integrations/external-group", "t-e"),
+                ("/v3/benchmark/control", "t-bc"),
+                ("/v3/benchmark/framework", "t-bf"),
+                ("/v3/policies/assurance-control", "t-ac"),
+                ("/v3/policies/admission-controller/control", "t-adc"),
+                ("/v3/policies/admission-controller", "t-adp"),
+                ("/v3/policies/runtime-profile", "t-rp"),
+            ],
+        )
+        .await;
+
+        let client = v3_client(&server.uri())?;
+        import_bundle(&client, &bundle, &ImportOptions::default()).await?;
+
+        let seen = server.received_requests().await.unwrap_or_default();
+        let order: Vec<String> = seen
+            .iter()
+            .filter(|r| r.method == wiremock::http::Method::POST)
+            .map(|r| r.url.path().to_string())
+            .collect();
+
+        let at = |p: &str| -> Result<usize> {
+            order
+                .iter()
+                .position(|seen| seen == p)
+                .ok_or_else(|| anyhow!("{p} was never POSTed; order was {order:?}"))
+        };
+
+        // Controls before their consumers.
+        assert!(at("/v3/benchmark/control")? < at("/v3/benchmark/framework")?);
+        assert!(
+            at("/v3/policies/admission-controller/control")?
+                < at("/v3/policies/admission-controller")?
+        );
+        // Integrations before the policies that may reference them.
+        assert!(at("/v3/integrations/siem")? < at("/v3/policies/runtime-profile")?);
+        assert!(at("/v3/integrations/external-group")? < at("/v3/policies/runtime-profile")?);
+        // Assurance controls before assurance policies would run.
+        assert!(at("/v3/policies/assurance-control")? < at("/v3/policies/admission-controller")?);
         Ok(())
     }
 }
